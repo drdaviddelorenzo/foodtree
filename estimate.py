@@ -83,6 +83,7 @@ def ingredient_class(off_id: str, text: str = "", processing: str = "",
     fixed = {
         "en:potato-flakes": "potato_dehydrated", "en:dehydrated-potato": "potato_dehydrated",
         "en:potato-starch": "potato_starch", "en:potato-flour": "potato_flour",
+        "en:corn-starch": "corn_starch", "en:maize-starch": "corn_starch",
         "en:wheat-flour": "wheat_flour", "en:corn-flour": "corn_flour",
         "en:maize-flour": "corn_flour", "en:cornmeal": "cornmeal", "en:corn": "corn_grain",
         "en:rice-flour": "rice_flour", "en:maltodextrin": "maltodextrin",

@@ -1,5 +1,5 @@
 """Stage 2: turn raw product data into foods.csv
-(FoodItem, Ingredient, Percentage, PctLow, PctHigh, Category, Source).
+(FoodItem, Ingredient, Percentage, PctLow, PctHigh, Category, Class, Source).
 
     python normalise.py --input raw_products.json --output foods.csv [--moisture 1-4]
 
@@ -149,6 +149,7 @@ SYNONYMS: dict[str, str] = {
     "co2": "carbon_dioxide",
     "potato": "potato",
     "patata": "potato",
+    "dehydrated_potato": "dehydrated_potato",
     "tomato": "tomato",
     "tomate": "tomato",
     "corn": "corn",
@@ -156,13 +157,12 @@ SYNONYMS: dict[str, str] = {
     "maiz": "corn",
     "potatoes": "potato",
     "select_potatoes": "potato",
-    "dehydrated_potato": "potato",
-    "dehydrated_potatoes": "potato",
-    "dried_potato": "potato",
-    "cornmeal": "corn",
-    "corn_meal": "corn",
-    "maize_meal": "corn",
-    "maize_flour": "corn_flour",
+    "dehydrated_potatoes": "dehydrated_potato",
+    "dried_potato": "dehydrated_potato",
+    "potato_flakes": "dehydrated_potato",
+    "cornmeal": "cornmeal",
+    "corn_meal": "cornmeal",
+    "maize_meal": "cornmeal",
 }
 
 CATEGORIES: dict[str, str] = {
@@ -183,6 +183,9 @@ CATEGORIES: dict[str, str] = {
     "corn_starch": "base",       "potato_starch": "base",
     "rice_flour": "base",        "oat_flour": "base",
     "wheat_starch": "base",      "potato": "base",
+    "dehydrated_potato": "base", "potato_flour": "base",
+    "cornmeal": "base",          "corn_oil": "fat",
+    "residual_water": "water",
     "corn": "base",              "tomato": "base",
     "cod": "protein",            "alaska_pollock": "protein",
     "salmon": "protein",         "tuna": "protein",
@@ -324,6 +327,9 @@ def normalise_product(raw: dict, comp: dict, moisture: tuple[float, float] = (0.
             return None
         items, notes = _items_from_text(text), []
     items = [it for it in items if it.name and not _is_label_text(it.name)]
+    for it in items:
+        if it.cls == "potato_dehydrated" and it.name == "potato":
+            it.name = "dehydrated_potato"
     if not items:
         print(f"  [normalise] Could not extract ingredient names for '{product_name}'",
               file=sys.stderr)
@@ -359,6 +365,7 @@ def normalise_product(raw: dict, comp: dict, moisture: tuple[float, float] = (0.
             "PctLow": round(float(est.dry_low[i]), 3) if est.feasible else "",
             "PctHigh": round(float(est.dry_high[i]), 3) if est.feasible else "",
             "Category": CATEGORIES.get(it.name, "other"),
+            "Class": it.cls,
             "Source": source,
         })
     rows.append({
@@ -368,6 +375,7 @@ def normalise_product(raw: dict, comp: dict, moisture: tuple[float, float] = (0.
         "PctLow": round(float(est.water_low), 3) if est.feasible else "",
         "PctHigh": round(float(est.water_high), 3) if est.feasible else "",
         "Category": "water",
+        "Class": "",
         "Source": "inconsistent-label" if not est.feasible else "label-constrained",
     })
     return rows
@@ -499,7 +507,8 @@ def normalise_all(input_json: Path, output_csv: Path, manual_csv: Path | None = 
                  f"to build the tree without them.{kept}")
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["FoodItem", "Ingredient", "Percentage", "PctLow", "PctHigh", "Category", "Source"]
+    fieldnames = ["FoodItem", "Ingredient", "Percentage", "PctLow", "PctHigh", "Category", "Class",
+                  "Source"]
     tmp_csv = output_csv.with_name(f".{output_csv.name}.tmp")
     with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

@@ -72,6 +72,7 @@ def prompt_distance(default: str = "braycurtis") -> str:
         "2": ("aitchison",  "Aitchison    — differences in ratios (better for trace ingredients: caffeine, vitamins)"),
         "3": ("jaccard",    "Jaccard      — presence/absence only, ignores quantities entirely"),
         "4": ("euclidean",  "Euclidean    — raw percentage differences, dominated by the largest ingredient"),
+        "5": ("unifrac",    "UniFrac      — like Bray-Curtis, but related ingredients (two oils) count as close"),
     }
     default_num = next(k for k, (m, _) in options.items() if m == default)
 
@@ -83,7 +84,7 @@ def prompt_distance(default: str = "braycurtis") -> str:
 
     while True:
         try:
-            raw = input(f"  Choose 1–4 [{default_num}]: ").strip()
+            raw = input(f"  Choose 1–5 [{default_num}]: ").strip()
             if not raw:
                 chosen = default
                 break
@@ -93,7 +94,7 @@ def prompt_distance(default: str = "braycurtis") -> str:
             if raw in {m for m, _ in options.values()}:
                 chosen = raw
                 break
-            print("  Please enter a number 1–4.")
+            print("  Please enter a number 1–5.")
         except (EOFError, KeyboardInterrupt):
             print()
             chosen = default
@@ -140,7 +141,8 @@ def run_render(output_dir: Path, analysis_name: str, method: str,
                metric: str,
                outgroup: str | None = None,
                min_pct: float = 2.0,
-               export_data: bool = True) -> None:
+               export_data: bool = True,
+               level: str = "ingredient") -> None:
     from render import render_all
     foods_csv = output_dir / "foods.csv"
     if not foods_csv.exists():
@@ -155,6 +157,7 @@ def run_render(output_dir: Path, analysis_name: str, method: str,
         outgroup=outgroup,
         min_pct=min_pct,
         export_data=export_data,
+        level=level,
     )
 
 
@@ -172,7 +175,7 @@ def add_render_args(p):
     p.add_argument("--no-export", action="store_true",
                    help="Do not write the tree data files (Newick, JSON, distance CSV)")
     p.add_argument("--distance",
-                   choices=["braycurtis", "aitchison", "euclidean", "jaccard"],
+                   choices=["braycurtis", "aitchison", "euclidean", "jaccard", "unifrac"],
                    default=None,
                    help="Distance metric (default: braycurtis, or prompted interactively)")
     p.add_argument("--outgroup", default=None,
@@ -180,6 +183,9 @@ def add_render_args(p):
     p.add_argument("--min-pct", type=float, default=None,
                    help="Drop ingredients whose max across all products is below this %% "
                         "(default: 2.0, or prompted interactively). Use 0 to keep everything.")
+    p.add_argument("--level", choices=["ingredient", "source", "group"], default="ingredient",
+                   help="Compare ingredients as listed, or collapsed to their source or group "
+                        "in data/ingredient_tree.csv (default: ingredient)")
 
 
 def add_fetch_args(p):
@@ -264,6 +270,8 @@ def save_run_config(output_dir: Path, args, min_pct: float) -> None:
         cmd_parts.append("--allow-inconsistent")
     if getattr(args, "no_export", False):
         cmd_parts.append("--no-export")
+    if getattr(args, "level", "ingredient") != "ingredient":
+        cmd_parts.append(f"--level {args.level}")
 
     cmd =" \\\n    ".join(cmd_parts)
 
@@ -331,7 +339,7 @@ def main():
         print("\n▶ Stage 3: Render")
         run_render(output_dir, args.name, args.method, distance,
                    outgroup=args.outgroup, min_pct=min_pct,
-                   export_data=not args.no_export)
+                   export_data=not args.no_export, level=args.level)
         args.distance = distance
         save_run_config(output_dir, args, min_pct)
         print("\n" + "=" * 60)
@@ -354,7 +362,7 @@ def main():
             distance = prompt_distance()
         run_render(output_dir, args.name, args.method, distance,
                    outgroup=args.outgroup, min_pct=min_pct,
-                   export_data=not args.no_export)
+                   export_data=not args.no_export, level=args.level)
         args.distance = distance
         save_run_config(output_dir, args, min_pct)
 

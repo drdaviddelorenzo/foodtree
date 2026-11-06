@@ -3,6 +3,7 @@ potato_raw,75,82,0,0.2,13,21,1.6,2.5,0,0.05,USDA SR Legacy 170026 170028 170029,
 potato_dehydrated,5,9,0.2,1.2,70,80,6.5,10,0,0.3,USDA SR Legacy 170445,"Potato flakes without milk, dry form (water 6.58, fat 0.41, protein 8.34, EU carbohydrate 74.6)"
 potato_flour,5,10,0.2,1.2,72,80,6,9,0,0.2,USDA SR Legacy 168446; FDC Foundation 2261422,"Potato flour (water 6.52-8.28)"
 potato_starch,8,20,0,0.2,78,92,0,0.5,0,0.1,USDA SR Legacy 169698 (cornstarch),"No SR Legacy entry for potato starch: macronutrients from cornstarch; water widened to 20 to cover native potato starch"
+corn_starch,8,13,0,0.2,85,92,0,0.5,0,0.1,USDA SR Legacy 169698,"Cornstarch (water 8.32, EU carbohydrate 90.4)"
 wheat_flour,10,14,0.8,1.8,70,76,9,12,0,0.05,USDA SR Legacy 169761,"White wheat flour (water 11.9, fat 0.98, protein 10.3, EU carbohydrate 73.6)"
 corn_flour,9,12,1.2,4.2,68,81,5.5,9,0,0.05,USDA SR Legacy 169695 170290 169696,"Maize flour, degermed to whole-grain and masa (fat 1.39-3.86)"
 cornmeal,9,12,1.5,3.8,69,76,6.5,8.5,0,0.1,USDA SR Legacy 168929 169697,"Cornmeal, degermed to whole-grain (fat 1.75-3.59, EU carbohydrate 69.6-75.6)"

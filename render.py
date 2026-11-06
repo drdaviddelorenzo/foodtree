@@ -22,6 +22,8 @@ from scipy.spatial.distance import pdist, squareform
 from Bio import Phylo
 from Bio.Phylo.TreeConstruction import DistanceMatrix, DistanceTreeConstructor
 
+import ontology
+
 warnings.filterwarnings("ignore")
 
 
@@ -56,9 +58,27 @@ def apply_dark_style(fig, ax):
         spine.set_edgecolor(STYLE["grid"])
 
 
+def apply_min_pct(pivot: pd.DataFrame, min_pct: float, unit: str = "ingredient") -> pd.DataFrame:
+    """Drop columns whose maximum across products is below min_pct."""
+    if min_pct <= 0:
+        return pivot
+    before = len(pivot.columns)
+    pivot = pivot.loc[:, pivot.max(axis=0) >= min_pct]
+    dropped = before - len(pivot.columns)
+    if dropped:
+        print(f"  Dropped {dropped} {unit}(s) with max < {min_pct}% "
+              f"({len(pivot.columns)} remaining)")
+    empty = pivot.index[pivot.sum(axis=1) <= 0].tolist()
+    if empty:
+        raise ValueError(f"Nothing left after --min-pct {min_pct} for: "
+                         f"{', '.join(empty)}. Lower --min-pct.")
+    return pivot
+
+
 def load_foods(csv_path: Path,
-               min_pct: float = 2.0) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load foods.csv into a pivot table and drop minor ingredients."""
+               min_pct: float = 2.0) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
+    """Load foods.csv into a pivot table, drop minor ingredients, and return the
+    category table and each ingredient's composition class."""
     df = pd.read_csv(csv_path)
     df["Percentage"] = pd.to_numeric(df["Percentage"], errors="coerce").fillna(0)
 
@@ -72,24 +92,20 @@ def load_foods(csv_path: Path,
         raise ValueError(f"No ingredient percentages for: {', '.join(empty)}")
     pivot = pivot.div(row_sums, axis=0) * 100
 
-    if min_pct > 0:
-        before = len(pivot.columns)
-        pivot = pivot.loc[:, pivot.max(axis=0) >= min_pct]
-        dropped = before - len(pivot.columns)
-        if dropped:
-            print(f"  Dropped {dropped} ingredient(s) with max < {min_pct}% "
-                  f"({len(pivot.columns)} remaining)")
-        empty = pivot.index[pivot.sum(axis=1) <= 0].tolist()
-        if empty:
-            raise ValueError(f"No ingredient left after --min-pct {min_pct} for: "
-                             f"{', '.join(empty)}. Lower --min-pct.")
+    pivot = apply_min_pct(pivot, min_pct)
 
     meta = pd.DataFrame()
     if "Category" in df.columns:
         meta = df[["Ingredient", "Category"]].drop_duplicates().set_index("Ingredient")
         meta = meta[meta.index.isin(pivot.columns)]
 
-    return pivot, meta
+    classes: dict[str, str] = {}
+    if "Class" in df.columns:
+        for ing, cls in zip(df["Ingredient"], df["Class"].fillna("")):
+            if cls and ing not in classes:
+                classes[ing] = cls
+
+    return pivot, meta, classes
 
 
 def bray_curtis(pivot: pd.DataFrame) -> np.ndarray:
@@ -123,6 +139,18 @@ DISTANCE_FUNCTIONS = {
     "euclidean":  euclidean,
     "jaccard":    jaccard,
 }
+
+
+_CONTEXT: dict = {"classes": {}, "categories": {}, "tree": None}
+
+
+def unifrac(pivot: pd.DataFrame) -> np.ndarray:
+    """Weighted UniFrac over the ingredient tree (see ontology.py)."""
+    tree = _CONTEXT["tree"] or ontology.IngredientTree()
+    return ontology.weighted_unifrac(pivot, tree, _CONTEXT["classes"], _CONTEXT["categories"])
+
+
+DISTANCE_FUNCTIONS["unifrac"] = unifrac
 
 
 def build_distance_matrix(pivot: pd.DataFrame, metric: str) -> np.ndarray:
@@ -325,8 +353,17 @@ def _leaf_names(node: dict) -> list[str]:
     return [name for c in node["children"] for name in _leaf_names(c)]
 
 
+def _newick_label(name: str) -> str:
+    """A Newick label: spaces become underscores; labels with other special characters are
+    quoted, doubling any single quote (Newick standard)."""
+    label = name.replace(" ", "_")
+    if any(ch in label for ch in "'(),:;[]"):
+        label = "'" + label.replace("'", "''") + "'"
+    return label
+
+
 def _newick(node: dict) -> str:
-    name = "".join(ch for ch in (node["name"] or "") if ch not in ",:;()[]").replace(" ", "_")
+    name = _newick_label(node["name"] or "")
     inner = "(" + ",".join(_newick(c) for c in node["children"]) + ")" if "children" in node else ""
     return f"{inner}{name}:{node['branch_length']}"
 
@@ -601,8 +638,12 @@ class RecoveryNeeded(RuntimeError):
 def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
                method: str = "upgma", metric: str = "braycurtis",
                outgroup: str | None = None,
-               min_pct: float = 2.0, export_data: bool = True) -> None:
+               min_pct: float = 2.0, export_data: bool = True,
+               level: str = "ingredient") -> None:
     """Render the trees, distance matrix, heatmap and table, and export the tree data.
+
+    level collapses ingredients to their source (e.g. all potato products) or group (e.g.
+    starchy bases) in the ingredient tree before distances are computed.
 
     Files are written to a temporary folder and moved into output_dir only when all of them
     have been produced, so a failed render leaves the previous outputs untouched.
@@ -611,8 +652,24 @@ def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
     slug = analysis_name.lower().replace(" ", "-")
 
     print(f"\nLoading {foods_csv}...")
-    pivot, meta = load_foods(foods_csv, min_pct=min_pct)
-    print(f"  {len(pivot)} products × {len(pivot.columns)} ingredients")
+    if level != "ingredient" and level not in ontology.LEVELS:
+        raise ValueError(f"Unknown level '{level}'. Choose from: ingredient, "
+                         + ", ".join(ontology.LEVELS))
+    pivot, meta, classes = load_foods(foods_csv, min_pct=min_pct if level == "ingredient" else 0)
+    categories = meta["Category"].to_dict() if not meta.empty else {}
+    tree = ontology.IngredientTree()
+    other = ontology.share_under(pivot, tree, "other", classes, categories)
+    for product, share in other[other > 5].items():
+        print(f"  WARNING: {share:.1f}% of {product} is under 'other' in the ingredient tree "
+              "(unknown class and category); it is compared as one undifferentiated group")
+    if level != "ingredient":
+        slug = f"{slug}-{level}"
+        pivot = ontology.collapse(pivot, tree, ontology.LEVELS[level], classes, categories)
+        pivot = apply_min_pct(pivot, min_pct, unit=level)
+        meta, classes, categories = pd.DataFrame(), {}, {}
+    _CONTEXT.update(classes=classes, categories=categories, tree=tree)
+    print(f"  {len(pivot)} products × {len(pivot.columns)} "
+          f"{'ingredients' if level == 'ingredient' else level + 's'}")
 
     if outgroup:
         if outgroup in pivot.index:
@@ -669,7 +726,7 @@ def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
             raise RuntimeError(f"Render did not produce: {', '.join(missing)}")
         publish_outputs(tmp_dir, output_dir, files, slug, metric, {
             "input": foods_csv, "method": method, "distance": metric, "min_pct": min_pct,
-            "outgroup": outgroup or "none", "export": export_data,
+            "outgroup": outgroup or "none", "export": export_data, "level": level,
             "products": len(pivot), "ingredients": len(pivot.columns),
         })
     except RecoveryNeeded as exc:
@@ -700,6 +757,9 @@ def main():
                              "(e.g. 0.1 for energy drinks to keep caffeine/taurine).")
     parser.add_argument("--no-export", action="store_true",
                         help="Do not write the tree data files (Newick, JSON, distance CSV)")
+    parser.add_argument("--level", choices=["ingredient", "source", "group"], default="ingredient",
+                        help="Compare ingredients as listed, or collapsed to their source or group "
+                             "in data/ingredient_tree.csv (default: ingredient)")
     args = parser.parse_args()
 
     render_all(
@@ -711,6 +771,7 @@ def main():
         outgroup=args.outgroup,
         min_pct=args.min_pct,
         export_data=not args.no_export,
+        level=args.level,
     )
 
 
