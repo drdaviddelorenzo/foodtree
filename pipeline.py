@@ -138,6 +138,45 @@ def snapshot_problem(data) -> str | None:
                     return f"{r['product_name']}: {source}.{key} should be a {kind.__name__}"
             if any(not isinstance(i, dict) for i in block.get("ingredients") or []):
                 return f"{r['product_name']}: {source}.ingredients should hold objects"
+            for key in ("usda_description", "usda_brand", "off_product_name", "off_brands"):
+                if block.get(key) is not None and not isinstance(block[key], str):
+                    return f"{r['product_name']}: {source}.{key} should be a string"
+        problem = _parse_problem(r)
+        if problem:
+            return f"{r['product_name']}: {problem}"
+    return None
+
+
+def _parse_problem(record: dict) -> str | None:
+    """Run the parsing that normalise.py does on one record (without estimating anything),
+    so that any field it cannot read is caught before the input is replaced."""
+    import estimate
+    import normalise
+    off = record.get("off_data") or {}
+    try:
+        if off.get("ingredients"):
+            stack = list(off["ingredients"])
+            while stack:
+                ing = stack.pop()
+                if not isinstance(ing, dict):
+                    return "an ingredient (or sub-ingredient) is not an object"
+                for key in ("id", "text", "processing"):
+                    if ing.get(key) is not None and not isinstance(ing[key], str):
+                        return f"ingredient field '{key}' should be a string"
+                if ing.get("percent") is not None:
+                    float(ing["percent"])
+                subs = ing.get("ingredients")
+                if subs is not None and not isinstance(subs, list):
+                    return "sub-ingredients should be a list"
+                stack.extend(subs or [])
+            estimate.top_level_items(off, normalise._off_name)
+        elif off.get("ingredients_raw_text"):
+            normalise._items_from_text(off["ingredients_raw_text"])
+        for block in (record.get("usda_data") or {}, off):
+            estimate.nutrient_targets({k: v for k, v in (block.get("nutrients_per_100g") or {}).items()
+                                       if v is not None})
+    except (AttributeError, TypeError, ValueError, KeyError) as exc:
+        return f"cannot be parsed ({exc})"
     return None
 
 
@@ -145,6 +184,14 @@ def use_snapshot(snapshot: Path, target: Path) -> None:
     """Copy a saved raw_products.json into the analysis folder, replacing the existing one
     only after the copy has been checked. Each run uses its own temporary file."""
     if snapshot.resolve() == target.resolve():
+        try:
+            problem = snapshot_problem(json.loads(snapshot.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as exc:
+            problem = str(exc)
+        if problem:
+            print(f"Error: {snapshot} is not a usable raw_products.json ({problem}).",
+                  file=sys.stderr)
+            sys.exit(1)
         return
     fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
     os.close(fd)

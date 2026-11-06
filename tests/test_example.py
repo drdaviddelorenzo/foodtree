@@ -93,7 +93,10 @@ def test_snapshot_is_checked_before_replacing(tmp_path):
     repo = EXAMPLE.parent.parent.parent
     (tmp_path / "raw_products.json").write_text("[]")
     for k, content in enumerate(["{not json", '[{"product_name": "X", "off_data": "bad"}]',
-                                 '[{"product_name": "X", "off_data": {"ingredients": "bad"}}]']):
+                                 '[{"product_name": "X", "off_data": {"ingredients": "bad"}}]',
+                                 '[{"product_name": "X", "off_data": {"ingredients": '
+                                 '[{"id": "en:salt", "ingredients": ["bad"]}]}}]',
+                                 '[{"product_name": "X", "usda_data": {"usda_description": 3}}]']):
         broken = tmp_path / f"broken{k}.json"
         broken.write_text(content)
         out = subprocess.run([sys.executable, "pipeline.py", "run", "--snapshot", str(broken),
@@ -102,3 +105,15 @@ def test_snapshot_is_checked_before_replacing(tmp_path):
         assert out.returncode == 1
         assert (tmp_path / "raw_products.json").read_text() == "[]"
         assert not list(tmp_path.glob(".raw_products.json.*.tmp"))
+
+
+def test_same_path_snapshot_is_still_checked(tmp_path):
+    import subprocess
+    import sys
+    repo = EXAMPLE.parent.parent.parent
+    target = tmp_path / "raw_products.json"
+    target.write_text('[{"product_name": "X", "off_data": "bad"}]')
+    out = subprocess.run([sys.executable, "pipeline.py", "run", "--snapshot", str(target),
+                          "--name", "X", "--dir", str(tmp_path)], cwd=repo,
+                         capture_output=True, text=True)
+    assert out.returncode == 1 and "not a usable" in out.stderr
