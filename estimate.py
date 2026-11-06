@@ -200,7 +200,7 @@ def nutrient_value(nutrients: dict, nut: str) -> float | None:
     v = _finite(nutrients.get(NUTRIENT_KEYS[nut]))
     if v is None and nut == "salt":
         sodium = _finite(nutrients.get("sodium_g"))
-        v = 2.5 * sodium if sodium is not None else None
+        v = _finite(2.5 * sodium) if sodium is not None else None
     return v
 
 

@@ -89,6 +89,8 @@ def test_order_rule_allows_small_ingredients_out_of_order():
 def test_non_finite_values_count_as_not_declared():
     assert estimate.nutrient_value({"fat_g": float("nan")}, "fat") is None
     assert estimate.nutrient_value({"salt_g": None, "sodium_g": float("inf")}, "salt") is None
+    assert estimate.nutrient_value({"salt_g": None, "sodium_g": 1e308}, "salt") is None
+    assert estimate.nutrient_value({"sodium_g": 0.4}, "salt") == pytest.approx(1.0)
     off = {"ingredients": [{"id": "en:salt", "text": "salt", "percent": "NaN"}],
            "ingredients_raw_text": "salt"}
     items, _ = estimate.top_level_items(off, lambda ing: "salt")
