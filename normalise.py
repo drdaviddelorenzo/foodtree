@@ -17,6 +17,11 @@ import argparse
 import unicodedata
 from pathlib import Path
 
+import hashlib
+import zlib
+
+import numpy as np
+
 import estimate
 
 
@@ -295,9 +300,55 @@ def _items_from_text(text: str) -> list[estimate.Item]:
     return items
 
 
+REPLICATES = 200
+
+
+def samples_path(output_csv: Path) -> Path:
+    return output_csv.with_name(f"{output_csv.stem}-samples.csv")
+
+
+def samples_meta_path(output_csv: Path) -> Path:
+    return output_csv.with_name(f"{output_csv.stem}-samples.json")
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def publish_together(pairs: list[tuple[Path, Path]]) -> None:
+    """Move several temporary files into place as one unit: files being replaced are moved
+    aside first and put back if any move fails.
+
+    This covers errors raised during publication, not the process being killed half way. In
+    that case the folder may hold files from two runs; the fingerprints in
+    foods-samples.json then no longer match, render.py refuses those replicates and asks for
+    normalise to be rerun, so no support is ever computed from mismatched files."""
+    moved, placed = [], []
+    try:
+        for tmp, dest in pairs:
+            if dest.exists():
+                backup = dest.with_name(f".{dest.name}.previous")
+                os.replace(dest, backup)
+                moved.append((backup, dest))
+            os.replace(tmp, dest)
+            placed.append(dest)
+    except BaseException:
+        for dest in placed:
+            dest.unlink(missing_ok=True)
+        for backup, dest in moved:
+            os.replace(backup, dest)
+        raise
+    for backup, _ in moved:
+        backup.unlink(missing_ok=True)
+
+
 def normalise_product(raw: dict, comp: dict, moisture: tuple[float, float] = (0.0, 100.0),
-                      allow_inconsistent: bool = False) -> list[dict] | None:
-    """Rows of foods.csv for one product, or None if it has no usable ingredient data.
+                      allow_inconsistent: bool = False) -> tuple[list[dict], list[dict]] | None:
+    """Rows of foods.csv for one product and its replicate compositions, or None if it has no
+    usable ingredient data.
+
+    Replicates are REPLICATES compositions resampled from the estimator's weighted samples;
+    render.py uses them to measure how well supported each branch of a tree is.
 
     Percentages are on a finished-product basis: the dry matter each ingredient leaves in
     100 g of product, plus residual water as its own row. Each is the weighted mean of the
@@ -378,7 +429,13 @@ def normalise_product(raw: dict, comp: dict, moisture: tuple[float, float] = (0.
         "Class": "",
         "Source": "inconsistent-label" if not est.feasible else "label-constrained",
     })
-    return rows
+    rng = np.random.default_rng(zlib.crc32(product_name.encode("utf-8")))
+    picks = rng.choice(len(est.samples), size=REPLICATES, p=est.weights)
+    names = [it.name for it in items] + ["residual_water"]
+    replicates = [{"FoodItem": product_name, "Replicate": r, "Ingredient": name,
+                   "Percentage": round(float(v), 3)}
+                  for r, k in enumerate(picks) for name, v in zip(names, est.samples[k])]
+    return rows, replicates
 
 
 def load_manual(manual_csv: Path) -> dict[str, list[dict]]:
@@ -433,7 +490,8 @@ def parse_moisture(text: str | None) -> tuple[float, float]:
 def normalise_all(input_json: Path, output_csv: Path, manual_csv: Path | None = None,
                   allow_missing: bool = False, moisture: tuple[float, float] = (0.0, 100.0),
                   allow_inconsistent: bool = False) -> list[str]:
-    """Write foods.csv and return the products left out.
+    """Write foods.csv and foods-samples.csv (replicate compositions) and return the
+    products left out.
 
     A product without usable data stops the run unless allow_missing is set; the products
     left out are then listed in <output>-omitted.txt. A product whose label no composition
@@ -446,6 +504,7 @@ def normalise_all(input_json: Path, output_csv: Path, manual_csv: Path | None = 
 
     all_rows = []
     failed = []
+    all_replicates: list[dict] = []
     inconsistent: list[InconsistentLabel] = []
     unsampled: list[SamplingFailure] = []
 
@@ -461,7 +520,7 @@ def normalise_all(input_json: Path, output_csv: Path, manual_csv: Path | None = 
             print(f"  → taken from {manual_csv.name}")
             continue
         try:
-            rows = normalise_product(raw, comp, moisture, allow_inconsistent)
+            result = normalise_product(raw, comp, moisture, allow_inconsistent)
         except SamplingFailure as exc:
             unsampled.append(exc)
             print("  ✗ No composition sampled")
@@ -470,8 +529,10 @@ def normalise_all(input_json: Path, output_csv: Path, manual_csv: Path | None = 
             inconsistent.append(exc)
             print("  ✗ Label inconsistent")
             continue
-        if rows:
+        if result:
+            rows, replicates = result
             all_rows.extend(rows)
+            all_replicates.extend(replicates)
             print(f"  ✓ {len(rows) - 1} ingredients + residual water")
         else:
             failed.append(name)
@@ -514,7 +575,24 @@ def normalise_all(input_json: Path, output_csv: Path, manual_csv: Path | None = 
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_rows)
-    os.replace(tmp_csv, output_csv)
+    tmp_samples = output_csv.with_name(f".{samples_path(output_csv).name}.tmp")
+    with open(tmp_samples, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["FoodItem", "Replicate", "Ingredient", "Percentage"])
+        writer.writeheader()
+        writer.writerows(all_replicates)
+    tmp_meta = output_csv.with_name(f".{samples_meta_path(output_csv).name}.tmp")
+    tmp_meta.write_text(json.dumps({
+        "foods_sha256": file_sha256(tmp_csv),
+        "samples_sha256": file_sha256(tmp_samples),
+        "replicates": REPLICATES,
+        "products_with_replicates": sorted({r["FoodItem"] for r in all_replicates}),
+    }, indent=2), encoding="utf-8")
+    try:
+        publish_together([(tmp_csv, output_csv), (tmp_samples, samples_path(output_csv)),
+                          (tmp_meta, samples_meta_path(output_csv))])
+    finally:
+        for tmp in (tmp_csv, tmp_samples, tmp_meta):
+            tmp.unlink(missing_ok=True)
     if failed:
         omitted_file.write_text("\n".join(failed) + "\n", encoding="utf-8")
     else:

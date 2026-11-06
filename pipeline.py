@@ -142,7 +142,8 @@ def run_render(output_dir: Path, analysis_name: str, method: str,
                outgroup: str | None = None,
                min_pct: float = 2.0,
                export_data: bool = True,
-               level: str = "ingredient") -> None:
+               level: str = "ingredient",
+               support: int = 100) -> None:
     from render import render_all
     foods_csv = output_dir / "foods.csv"
     if not foods_csv.exists():
@@ -158,6 +159,7 @@ def run_render(output_dir: Path, analysis_name: str, method: str,
         min_pct=min_pct,
         export_data=export_data,
         level=level,
+        support=support,
     )
 
 
@@ -183,6 +185,8 @@ def add_render_args(p):
     p.add_argument("--min-pct", type=float, default=None,
                    help="Drop ingredients whose max across all products is below this %% "
                         "(default: 2.0, or prompted interactively). Use 0 to keep everything.")
+    p.add_argument("--support", type=int, default=100,
+                   help="Replicate trees for branch support (default 100; 0 to skip)")
     p.add_argument("--level", choices=["ingredient", "source", "group"], default="ingredient",
                    help="Compare ingredients as listed, or collapsed to their source or group "
                         "in data/ingredient_tree.csv (default: ingredient)")
@@ -272,6 +276,8 @@ def save_run_config(output_dir: Path, args, min_pct: float) -> None:
         cmd_parts.append("--no-export")
     if getattr(args, "level", "ingredient") != "ingredient":
         cmd_parts.append(f"--level {args.level}")
+    if getattr(args, "support", 100) != 100:
+        cmd_parts.append(f"--support {args.support}")
 
     cmd =" \\\n    ".join(cmd_parts)
 
@@ -339,7 +345,8 @@ def main():
         print("\n▶ Stage 3: Render")
         run_render(output_dir, args.name, args.method, distance,
                    outgroup=args.outgroup, min_pct=min_pct,
-                   export_data=not args.no_export, level=args.level)
+                   export_data=not args.no_export, level=args.level,
+                   support=args.support)
         args.distance = distance
         save_run_config(output_dir, args, min_pct)
         print("\n" + "=" * 60)
@@ -362,7 +369,8 @@ def main():
             distance = prompt_distance()
         run_render(output_dir, args.name, args.method, distance,
                    outgroup=args.outgroup, min_pct=min_pct,
-                   export_data=not args.no_export, level=args.level)
+                   export_data=not args.no_export, level=args.level,
+                   support=args.support)
         args.distance = distance
         save_run_config(output_dir, args, min_pct)
 

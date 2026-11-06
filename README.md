@@ -51,6 +51,12 @@ A label gives three kinds of evidence, on two different bases. The order of the 
 
 `Source` says whether the quantity used was `declared` on the label or `label-constrained`. A label that no composition satisfies stops the run with the label constraints in conflict (declared percentages, order, nutrition values or moisture), unless `--allow-inconsistent` is given (`Source` is then `inconsistent-label`). If the bounds admit a label but no compatible recipe is sampled, the run stops with a different message: the label may be fine and the ingredient classes should be checked. Products entered with `--manual` keep their values (`Source` `manual`).
 
+## How far a tree can be trusted
+
+`normalise` also writes `foods-samples.csv`: for each product, 200 compositions resampled from those compatible with its label (products entered by hand keep their values). `render` rebuilds the tree from 100 of them (`--support N`, 0 to skip) and labels each branch with the percentage of replicate trees that contain the same group of products; the numbers appear on the plots and as internal labels in the Newick and JSON files. This is in the spirit of the phylogenetic bootstrap, but it resamples what the labels leave undetermined, not characters: high support means a grouping does not depend on the unknown percentages, not that the ingredient tree, the distance or the tree method are right. Two products can be grouped with full support for a poor reason (for example, sharing an ingredient name under Bray-Curtis).
+
+Each render also writes `<name>-diagnostics-<distance>.txt` with the cophenetic correlation of the UPGMA tree (how well the tree preserves the distances; well below about 0.8 it distorts them), and a principal coordinates analysis (`<name>-pcoa-<distance>.png` and `.csv`), which places the products in a plane without forcing a tree, with the share of variation on each axis.
+
 ## Caveats
 
 Ingredient lists are what labels declare, and Open Food Facts is edited by its users: check the inputs before drawing conclusions. Composition ranges are generic and an ingredient whose class is unknown is left unconstrained, so bounds can be wide. Data licences: Open Food Facts (ODbL), USDA FoodData Central (public domain).

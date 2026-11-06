@@ -96,7 +96,7 @@ def collapse(pivot: pd.DataFrame, tree: IngredientTree, level: int,
              categories: dict[str, str] | None = None) -> pd.DataFrame:
     """Sum ingredient columns into their ancestors at the given depth (root = 0)."""
     nodes = nodes_of(pivot, tree, classes, categories)
-    groups = [tree.ancestor_at(node, level) for node in nodes]
+    groups = pd.Series([tree.ancestor_at(node, level) for node in nodes], index=pivot.columns)
     return pivot.T.groupby(groups, sort=False).sum().T
 
 

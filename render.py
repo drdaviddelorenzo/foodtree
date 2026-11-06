@@ -22,6 +22,7 @@ from scipy.spatial.distance import pdist, squareform
 from Bio import Phylo
 from Bio.Phylo.TreeConstruction import DistanceMatrix, DistanceTreeConstructor
 
+import diagnostics
 import ontology
 
 warnings.filterwarnings("ignore")
@@ -177,7 +178,8 @@ def get_upgma_leaf_order(pivot: pd.DataFrame, metric: str) -> list[str]:
 
 
 def render_upgma(pivot: pd.DataFrame, output_path: Path, title: str,
-                 metric: str, outgroup: str | None = None) -> None:
+                 metric: str, outgroup: str | None = None,
+                 support: dict | None = None) -> None:
     dist = build_distance_matrix(pivot, metric)
     labels = pivot.index.tolist()
     linked = linkage(dist, method="average")
@@ -185,7 +187,7 @@ def render_upgma(pivot: pd.DataFrame, output_path: Path, title: str,
     fig, ax = plt.subplots(figsize=STYLE["fig_portrait"])
     apply_dark_style(fig, ax)
 
-    dendrogram(
+    drawn = dendrogram(
         linked,
         labels=labels,
         orientation="left",
@@ -193,6 +195,20 @@ def render_upgma(pivot: pd.DataFrame, output_path: Path, title: str,
         color_threshold=0,
         above_threshold_color=STYLE["branch"],
     )
+    if support:
+        leaf_y = {leaf: 5 + 10 * i for i, leaf in enumerate(drawn["leaves"])}
+
+        def place(node):
+            if node.is_leaf():
+                return leaf_y[node.id], frozenset([labels[node.id]])
+            (yl, sl), (yr, sr) = place(node.left), place(node.right)
+            y, leaves = (yl + yr) / 2, sl | sr
+            if leaves in support:
+                ax.text(node.dist, y + 1.5, f"{support[leaves]:.0f}", color=STYLE["accent"],
+                        fontsize=8, ha="right", va="bottom")
+            return y, leaves
+
+        place(to_tree(linked))
 
     for lbl in ax.get_yticklabels():
         is_og = outgroup and lbl.get_text() == outgroup
@@ -201,7 +217,8 @@ def render_upgma(pivot: pd.DataFrame, output_path: Path, title: str,
         lbl.set_fontfamily(STYLE["font_family"])
         lbl.set_fontweight("bold" if is_og else "normal")
 
-    ax.set_xlabel(f"Distance ({metric})", color=STYLE["fg"], fontsize=10)
+    ax.set_xlabel(f"Distance ({metric})" + ("  ·  numbers: % of replicate trees with that group"
+                                              if support else ""), color=STYLE["fg"], fontsize=10)
     ax.set_title(f"{title}\nIngredient Similarity Tree (UPGMA · {metric})",
                  color=STYLE["accent"], fontsize=13, pad=14, fontweight="bold")
     if outgroup:
@@ -228,7 +245,8 @@ def _nj_leaf_order(clade) -> list[str]:
 
 def _draw_nj_clade(ax, clade, parent_x: float,
                    leaf_y: dict, max_depth: float,
-                   outgroup: str | None = None) -> float:
+                   outgroup: str | None = None, support: dict | None = None,
+                   labels: list[str] | None = None, labelled: set | None = None) -> float:
     """Recursively draw NJ tree branches as a horizontal dendrogram."""
     branch_len = clade.branch_length or 0.0
     x = parent_x + branch_len
@@ -247,10 +265,17 @@ def _draw_nj_clade(ax, clade, parent_x: float,
                 fontfamily=STYLE["font_family"])
         return y
 
-    child_ys = [_draw_nj_clade(ax, child, x, leaf_y, max_depth, outgroup)
-                for child in clade.clades]
+    labelled = set() if labelled is None else labelled
+    child_ys = [_draw_nj_clade(ax, child, x, leaf_y, max_depth, outgroup, support, labels,
+                               labelled) for child in clade.clades]
 
     node_y = (min(child_ys) + max(child_ys)) / 2
+    if support and labels:
+        key = diagnostics.split_key(frozenset(t.name for t in clade.get_terminals()), labels)
+        if key in support and key not in labelled:
+            labelled.add(key)
+            ax.text(x, node_y + 0.15, f"{support[key]:.0f}", color=STYLE["accent"],
+                    fontsize=8, ha="right", va="bottom")
 
     ax.plot([x, x], [min(child_ys), max(child_ys)],
             color=STYLE["branch"], lw=1.5, solid_capstyle="butt")
@@ -277,7 +302,7 @@ def build_nj_tree(pivot: pd.DataFrame, metric: str, outgroup: str | None = None)
 
 
 def render_nj(pivot: pd.DataFrame, output_path: Path, title: str,
-              metric: str, outgroup: str | None = None) -> None:
+              metric: str, outgroup: str | None = None, support: dict | None = None) -> None:
     labels = pivot.index.tolist()
     tree = build_nj_tree(pivot, metric, outgroup)
 
@@ -297,11 +322,12 @@ def render_nj(pivot: pd.DataFrame, output_path: Path, title: str,
     apply_dark_style(fig, ax)
 
     root_branch = tree.root.branch_length or 0.0
-    _draw_nj_clade(ax, tree.root, root_branch, leaf_y, max_depth, outgroup)
+    _draw_nj_clade(ax, tree.root, root_branch, leaf_y, max_depth, outgroup, support, labels)
 
     ax.set_xlim(-max_depth * 0.02, max_depth * 1.30)
     ax.set_ylim(-0.7, n - 0.3)
-    ax.set_xlabel(f"Distance ({metric})", color=STYLE["fg"], fontsize=10)
+    ax.set_xlabel(f"Distance ({metric})" + ("  ·  numbers: % of replicate trees with that split"
+                                              if support else ""), color=STYLE["fg"], fontsize=10)
     ax.set_yticks([])
     rooting = "outgroup rooted" if (outgroup and outgroup in labels) else "midpoint rooted"
     ax.set_title(
@@ -362,19 +388,43 @@ def _newick_label(name: str) -> str:
     return label
 
 
+def _annotate_support(node: dict, support: dict | None, key=lambda leaves: leaves,
+                      done: set | None = None) -> frozenset:
+    """Add a 'support' field (percentage) to internal nodes found in support, once per
+    group (a midpoint root splits one unrooted edge into two, which share a split)."""
+    done = set() if done is None else done
+    if "children" not in node:
+        return frozenset([node["name"]])
+    leaves = frozenset().union(*(_annotate_support(c, support, key, done)
+                                 for c in node["children"]))
+    if support and key(leaves) in support and key(leaves) not in done:
+        done.add(key(leaves))
+        node["support"] = round(support[key(leaves)], 1)
+    return leaves
+
+
 def _newick(node: dict) -> str:
-    name = _newick_label(node["name"] or "")
+    name = _newick_label(node["name"] or (f"{node['support']:g}" if "support" in node else ""))
     inner = "(" + ",".join(_newick(c) for c in node["children"]) + ")" if "children" in node else ""
     return f"{inner}{name}:{node['branch_length']}"
 
 
 def export_tree_data(pivot: pd.DataFrame, metric: str, outgroup: str | None,
                      output_dir: Path, slug: str, analysis_name: str,
-                     methods: tuple[str, ...] = ("upgma", "nj")) -> None:
-    """Write the trees as Newick and JSON, and the distance matrix as CSV, to redraw them elsewhere."""
+                     methods: tuple[str, ...] = ("upgma", "nj"),
+                     supports: dict | None = None) -> None:
+    """Write the trees as Newick and JSON, and the distance matrix as CSV, to redraw them
+    elsewhere. Internal nodes carry their support (% of replicate trees) when computed."""
+    supports = supports or {}
+    labels = pivot.index.tolist()
     builders = {"upgma": lambda: _upgma_dict(pivot, metric),
                 "nj": lambda: _clade_dict(build_nj_tree(pivot, metric, outgroup).root)}
     trees = {m: builders[m]() for m in methods}
+    if "upgma" in trees:
+        _annotate_support(trees["upgma"], supports.get("upgma"))
+    if "nj" in trees:
+        _annotate_support(trees["nj"], supports.get("nj"),
+                          key=lambda leaves: diagnostics.split_key(leaves, labels))
     for method, tree in trees.items():
         base = output_dir / f"{slug}-tree-{method}-{metric}"
         info = {"analysis": analysis_name, "method": method, "distance": metric,
@@ -536,7 +586,8 @@ def output_files(slug: str, metric: str, methods: tuple[str, ...], export_data: 
         files += [f"{slug}-tree-{m}-{metric}{ext}" for m in methods for ext in (".json", ".nwk")]
         files.append(f"{slug}-distance-{metric}.csv")
     files += [f"{slug}-distance-{metric}.png", f"{slug}-heatmap-{metric}.png",
-              f"{slug}-table-{metric}.csv"]
+              f"{slug}-table-{metric}.csv", f"{slug}-pcoa-{metric}.png",
+              f"{slug}-pcoa-{metric}.csv", f"{slug}-diagnostics-{metric}.txt"]
     return files
 
 
@@ -635,11 +686,128 @@ class RecoveryNeeded(RuntimeError):
         self.keep_tmp = keep_tmp
 
 
+def compute_supports(foods_csv: Path, pivot: pd.DataFrame, metric: str, methods, level: str,
+                     classes: dict, categories: dict, tree, n: int) -> tuple[dict, int, int, str]:
+    """Branch support from the replicate compositions written by normalise.py.
+
+    Each replicate table goes through the same steps as the main one (shares of 100,
+    collapsing to the level, the same columns kept) before its tree is built. Every branch
+    of the reference tree starts at zero, so unsupported branches are reported as 0. A
+    replicate whose distances are undefined (a product with nothing left after filtering)
+    is excluded and counted. Returns supports, replicates used, replicates excluded, and a
+    note when support could not be computed.
+    """
+    if n <= 0:
+        return {}, 0, 0, "--support 0 was given"
+    replicates, why = diagnostics.load_replicates(foods_csv)
+    if replicates is None:
+        return {}, 0, 0, why
+    raw = pd.read_csv(foods_csv)
+    point = raw.pivot_table(index="FoodItem", columns="Ingredient", values="Percentage",
+                            aggfunc="sum").fillna(0)
+    labels = pivot.index.tolist()
+    reference_dist = build_distance_matrix(pivot, metric)
+    counts = {m: {} for m in methods}
+    if "upgma" in methods:
+        counts["upgma"] = {c: 0 for c in diagnostics.upgma_clades(reference_dist, labels)}
+    if "nj" in methods:
+        counts["nj"] = {sp: 0 for sp in diagnostics.splits(build_nj_tree(pivot, metric), labels)}
+    used = excluded = 0
+    for table in diagnostics.replicate_tables(replicates, point, n):
+        table = table.reindex(index=labels).fillna(0)
+        table = table.div(table.sum(axis=1), axis=0) * 100
+        if level != "ingredient":
+            table = ontology.collapse(table, tree, ontology.LEVELS[level], classes, categories)
+        table = table.reindex(columns=pivot.columns, fill_value=0)
+        if (table.sum(axis=1) <= 0).any():
+            excluded += 1
+            continue
+        try:
+            dist = build_distance_matrix(table, metric)
+        except ValueError:
+            excluded += 1
+            continue
+        used += 1
+        if "upgma" in methods:
+            for clade in diagnostics.upgma_clades(dist, labels):
+                if clade in counts["upgma"]:
+                    counts["upgma"][clade] += 1
+        if "nj" in methods:
+            for split in diagnostics.splits(build_nj_tree(table, metric), labels):
+                if split in counts["nj"]:
+                    counts["nj"][split] += 1
+    if not used:
+        return {}, 0, excluded, "every replicate had undefined distances"
+    return ({m: {k: 100 * v / used for k, v in c.items()} for m, c in counts.items()},
+            used, excluded, "")
+
+
+def render_pcoa(pivot: pd.DataFrame, metric: str, output_png: Path, output_csv: Path,
+                title: str) -> tuple[np.ndarray, float]:
+    labels = pivot.index.tolist()
+    coords, explained, negative = diagnostics.pcoa(build_distance_matrix(pivot, metric), labels)
+    coords.round(6).to_csv(output_csv)
+    fig, ax = plt.subplots(figsize=STYLE["fig_square"])
+    apply_dark_style(fig, ax)
+    x = coords.iloc[:, 0] if coords.shape[1] > 0 else pd.Series(0.0, index=labels)
+    y = coords.iloc[:, 1] if coords.shape[1] > 1 else pd.Series(0.0, index=labels)
+    ax.scatter(x, y, color=STYLE["accent"], s=30)
+    for name in labels:
+        ax.annotate(name, (x[name], y[name]), color=STYLE["leaf"], fontsize=9,
+                    xytext=(4, 4), textcoords="offset points")
+    pct = [f"{100 * e:.0f}%" for e in explained[:2]] + ["0%", "0%"]
+    ax.set_xlabel(f"PCo1 ({pct[0]})", color=STYLE["fg"])
+    ax.set_ylabel(f"PCo2 ({pct[1]})", color=STYLE["fg"])
+    ax.set_title(f"{title} — Principal coordinates ({metric})", color=STYLE["accent"],
+                 fontsize=13, pad=12, fontweight="bold")
+    plt.tight_layout()
+    fig.savefig(output_png, dpi=STYLE["dpi"], bbox_inches="tight", facecolor=STYLE["bg"])
+    plt.close(fig)
+    print(f"  ✓ PCoA → {output_png.name}")
+    return explained, negative
+
+
+def write_diagnostics(path: Path, pivot: pd.DataFrame, metric: str, methods, supports: dict,
+                      n_used: int, explained: np.ndarray, negative: float,
+                      n_excluded: int = 0, why: str = "") -> None:
+    dist = build_distance_matrix(pivot, metric)
+    lines = [f"FoodTree diagnostics ({metric})", ""]
+    if len(pivot) > 2:
+        r = diagnostics.cophenetic_correlation(dist)
+        lines += [f"Cophenetic correlation of the UPGMA tree: {r:.3f}",
+                  "  (agreement between the distances and the tree; well below 0.8, the tree "
+                  "distorts them)", ""]
+    shares = ", ".join(f"PCo{i + 1} {100 * e:.1f}%" for i, e in enumerate(explained[:3]))
+    lines += [f"PCoA: {shares}" if shares else "PCoA: no positive axis",
+              f"  share of variation on negative eigenvalues (non-Euclidean part): {100 * negative:.1f}%",
+              ""]
+    if n_used:
+        lines.append(f"Branch support from {n_used} replicate compositions (% of replicate trees "
+                     "with each group of products):")
+        if n_excluded:
+            lines.append(f"  {n_excluded} further replicates were excluded because some distance "
+                         "was undefined (a product with nothing left after filtering); support is "
+                         f"over the {n_used} used.")
+        for m in methods:
+            lines.append(f"  {m.upper()}:")
+            reference = (diagnostics.upgma_clades(dist, pivot.index.tolist()) if m == "upgma"
+                         else diagnostics.splits(build_nj_tree(pivot, metric), pivot.index.tolist()))
+            for group in sorted(reference, key=len):
+                lines.append(f"    {supports.get(m, {}).get(group, 0.0):5.1f}  "
+                             + ", ".join(sorted(group)))
+    else:
+        lines.append(f"Branch support: not computed ({why}).")
+    lines += ["", "Support measures robustness to what the labels leave undetermined. It does "
+              "not cover errors in the labels, the ingredient tree, the distance or the tree "
+              "method."]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
                method: str = "upgma", metric: str = "braycurtis",
                outgroup: str | None = None,
                min_pct: float = 2.0, export_data: bool = True,
-               level: str = "ingredient") -> None:
+               level: str = "ingredient", support: int = 100) -> None:
     """Render the trees, distance matrix, heatmap and table, and export the tree data.
 
     level collapses ingredients to their source (e.g. all potato products) or group (e.g.
@@ -662,6 +830,7 @@ def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
     for product, share in other[other > 5].items():
         print(f"  WARNING: {share:.1f}% of {product} is under 'other' in the ingredient tree "
               "(unknown class and category); it is compared as one undifferentiated group")
+    orig_classes, orig_categories = dict(classes), dict(categories)
     if level != "ingredient":
         slug = f"{slug}-{level}"
         pivot = ontology.collapse(pivot, tree, ontology.LEVELS[level], classes, categories)
@@ -683,6 +852,17 @@ def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
         raise ValueError(f"Unknown method '{method}'. Choose from: upgma, nj, both")
     files = output_files(slug, metric, methods, export_data)
 
+    supports, n_used, n_excluded, why = {}, 0, 0, "fewer than three products"
+    if len(pivot) > 2:
+        print(f"\nBranch support from replicate compositions...")
+        supports, n_used, n_excluded, why = compute_supports(
+            foods_csv, pivot, metric, methods, level, orig_classes, orig_categories, tree, support)
+        if n_used:
+            print(f"  {n_used} replicate trees" + (f" ({n_excluded} excluded: undefined distances)"
+                                                   if n_excluded else ""))
+        else:
+            print(f"  support not computed: {why}")
+
     tmp_dir = Path(tempfile.mkdtemp(prefix=".foodtree-render-", dir=output_dir))
     keep_tmp = False
     try:
@@ -691,14 +871,22 @@ def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
 
         if "upgma" in methods:
             render_upgma(pivot, tmp_dir / f"{slug}-tree-upgma-{metric}.png",
-                         analysis_name, metric, outgroup=outgroup)
+                         analysis_name, metric, outgroup=outgroup,
+                         support=supports.get("upgma"))
         if "nj" in methods:
             render_nj(pivot, tmp_dir / f"{slug}-tree-nj-{metric}.png",
-                      analysis_name, metric, outgroup=outgroup)
+                      analysis_name, metric, outgroup=outgroup, support=supports.get("nj"))
 
         if export_data:
             print("\nExporting tree data...")
-            export_tree_data(pivot, metric, outgroup, tmp_dir, slug, analysis_name, methods)
+            export_tree_data(pivot, metric, outgroup, tmp_dir, slug, analysis_name, methods,
+                             supports)
+
+        print("\nDiagnostics...")
+        explained, negative = render_pcoa(pivot, metric, tmp_dir / f"{slug}-pcoa-{metric}.png",
+                                          tmp_dir / f"{slug}-pcoa-{metric}.csv", analysis_name)
+        write_diagnostics(tmp_dir / f"{slug}-diagnostics-{metric}.txt", pivot, metric, methods,
+                          supports, n_used, explained, negative, n_excluded, why)
 
         print("\nRendering distance matrix...")
         render_distance_matrix(pivot,
@@ -728,6 +916,7 @@ def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
             "input": foods_csv, "method": method, "distance": metric, "min_pct": min_pct,
             "outgroup": outgroup or "none", "export": export_data, "level": level,
             "products": len(pivot), "ingredients": len(pivot.columns),
+            "support replicates": n_used, "support excluded": n_excluded,
         })
     except RecoveryNeeded as exc:
         keep_tmp = exc.keep_tmp
@@ -757,6 +946,8 @@ def main():
                              "(e.g. 0.1 for energy drinks to keep caffeine/taurine).")
     parser.add_argument("--no-export", action="store_true",
                         help="Do not write the tree data files (Newick, JSON, distance CSV)")
+    parser.add_argument("--support", type=int, default=100,
+                        help="Replicate trees for branch support (default 100; 0 to skip)")
     parser.add_argument("--level", choices=["ingredient", "source", "group"], default="ingredient",
                         help="Compare ingredients as listed, or collapsed to their source or group "
                              "in data/ingredient_tree.csv (default: ingredient)")
@@ -772,6 +963,7 @@ def main():
         min_pct=args.min_pct,
         export_data=not args.no_export,
         level=args.level,
+        support=args.support,
     )
 
 
