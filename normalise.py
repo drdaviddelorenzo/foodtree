@@ -155,6 +155,15 @@ SYNONYMS: dict[str, str] = {
     "corn": "corn",
     "maize": "corn",
     "maiz": "corn",
+    "potatoes": "potato",
+    "select_potatoes": "potato",
+    "dehydrated_potato": "potato",
+    "dehydrated_potatoes": "potato",
+    "dried_potato": "potato",
+    "cornmeal": "corn",
+    "corn_meal": "corn",
+    "maize_meal": "corn",
+    "maize_flour": "corn_flour",
 }
 
 CATEGORIES: dict[str, str] = {
@@ -351,13 +360,18 @@ def estimate_percentages_from_rank(
     return dict(zip(names, np.round(weights, 2)))
 
 
-LOW_FAT_BASE = {"potato", "corn", "wheat_flour", "corn_flour", "rice_flour", "potato_flour",
-                "potato_starch", "corn_starch", "wheat_starch", "maltodextrin", "tapioca_starch"}
+LOW_FAT_WORDS = ("potato", "corn", "maize", "wheat", "rice", "flour", "starch", "meal",
+                 "semolina", "cereal", "maltodextrin", "tapioca")
+MINOR_WORDS = ("flavour", "flavor", "aroma", "season", "condiment", "prepar", "whey", "cheese", "milk",
+               "cream", "buttermilk", "tomato", "onion", "garlic", "paprika", "pepper", "yeast", "sugar",
+               "dextrose", "acid", "extract", "spice", "lactose", "vinegar", "sweetener", "colour",
+               "color", "protein", "enhancer", "antioxidant", "emulsifier")
 SALT_NAMES = {"salt", "sea_salt"}
 
 
 def _is_additive(name: str) -> bool:
-    return bool(re.match(r"^e\d{3}[a-z]*(_|$)", name))
+    """E-numbers, flavourings and seasoning ingredients: present in small amounts."""
+    return bool(re.match(r"^e\d{3}[a-z]*(_|$)", name)) or any(w in name for w in MINOR_WORDS)
 
 
 def estimate_fried_snack(names: list[str], declared: dict[str, float],
@@ -373,7 +387,7 @@ def estimate_fried_snack(names: list[str], declared: dict[str, float],
     salts = [n for n in names if n in SALT_NAMES]
     additives = [n for n in names if _is_additive(n)]
     base = [n for n in names if n not in fats and n not in salts and n not in additives]
-    if fat is None or not fats or not base or any(n not in LOW_FAT_BASE for n in base):
+    if fat is None or not fats or not base or not all(any(w in n for w in LOW_FAT_WORDS) for n in base):
         return None
     pct = {n: declared[n] for n in names if n in declared}
     left = lambda: max(100.0 - sum(pct.values()), 0.0)
