@@ -236,7 +236,7 @@ def parse_off_tag(tag: str) -> str:
     """Convert an OFF ingredients_tag like 'en:cocoa-mass' to a canonical name."""
     if ":" in tag:
         tag = tag.split(":", 1)[1]
-    slug = tag.replace("-", "_").lower().strip("_")
+    slug = tag.replace("-", "_").replace(" ", "_").lower().strip("_")
     return SYNONYMS.get(slug, slug)
 
 
