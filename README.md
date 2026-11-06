@@ -34,7 +34,7 @@ The tree data is exported too, so you can redraw the trees in your own style: Ne
 
 ## Caveats
 
-Ingredient lists are what labels declare, and percentages are partly estimated: check the inputs before drawing conclusions. Open Food Facts is edited by its users. Data licences: Open Food Facts (ODbL), USDA FoodData Central (public domain).
+Ingredient lists are what labels declare. Percentages are label values when declared; for crisps and similar snacks, oils and salt come from the nutrition table (`label+nutrition`) and the rest is shared by rank; otherwise they are estimated. Check the inputs before drawing conclusions. Open Food Facts is edited by its users. Data licences: Open Food Facts (ODbL), USDA FoodData Central (public domain).
 
 ## Licence
 

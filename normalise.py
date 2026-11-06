@@ -351,6 +351,51 @@ def estimate_percentages_from_rank(
     return dict(zip(names, np.round(weights, 2)))
 
 
+LOW_FAT_BASE = {"potato", "corn", "wheat_flour", "corn_flour", "rice_flour", "potato_flour",
+                "potato_starch", "corn_starch", "wheat_starch", "maltodextrin", "tapioca_starch"}
+SALT_NAMES = {"salt", "sea_salt"}
+
+
+def _is_additive(name: str) -> bool:
+    return bool(re.match(r"^e\d{3}[a-z]*(_|$)", name))
+
+
+def estimate_fried_snack(names: list[str], declared: dict[str, float],
+                         nutrients: dict[str, float | None], decay: float = 0.65):
+    """Crisps and similar snacks, on a finished-product basis.
+
+    Declared percentages are kept. Oils get the fat of the nutrition table, salt gets the salt
+    of the table, additives get a trace, and the rest is shared by rank. Returns None when the
+    product is not of this kind (the general estimator is used instead).
+    """
+    fat, salt = nutrients.get("fat_g"), nutrients.get("salt_g")
+    fats = [n for n in names if n.endswith(("_oil", "_fat"))]
+    salts = [n for n in names if n in SALT_NAMES]
+    additives = [n for n in names if _is_additive(n)]
+    base = [n for n in names if n not in fats and n not in salts and n not in additives]
+    if fat is None or not fats or not base or any(n not in LOW_FAT_BASE for n in base):
+        return None
+    pct = {n: declared[n] for n in names if n in declared}
+    left = lambda: max(100.0 - sum(pct.values()), 0.0)
+    for n in salts:
+        if n not in pct and salt is not None:
+            pct[n] = min(salt, left())
+    free_fats = [n for n in fats if n not in pct]
+    if free_fats:
+        total = max(fat - sum(pct[n] for n in fats if n in pct), 0.0)
+        for n in free_fats:
+            pct[n] = min(total / len(free_fats), left())
+    for n in additives:
+        if n not in pct:
+            pct[n] = min(0.1, left())
+    free_base = [n for n in base if n not in pct]
+    if free_base:
+        w = np.array([decay ** i for i in range(len(free_base))])
+        for n, share in zip(free_base, w / w.sum() * left()):
+            pct[n] = float(share)
+    return {n: round(pct.get(n, 0.0), 3) for n in names}
+
+
 def normalise_product(raw: dict) -> list[dict] | None:
     """Normalise a single product. Returns list of row dicts or None if no data."""
     product_name = raw["product_name"]
@@ -409,10 +454,25 @@ def normalise_product(raw: dict) -> list[dict] | None:
         print(f"  [normalise] Could not extract ingredient names for '{product_name}'", file=sys.stderr)
         return None
 
+    nutrients = {
+        **(usda.get("nutrients_per_100g") or {}),
+        **(off.get("nutrients_per_100g") or {}),
+    }
+    nutrients = {k: v for k, v in nutrients.items() if v is not None}
+    declared = {}
+    for ing in raw_ingredients:
+        name = parse_off_tag(ing.get("id", "")) if ing.get("id") else canonical_name(ing.get("text", ""))
+        if ing.get("percent") is not None and name in names:
+            declared[name] = float(ing["percent"])
+    snack = estimate_fried_snack(names, declared, nutrients)
+
     available = [v for v in pct_map.values() if v is not None]
     coverage = len(available) / len(names) if names else 0
 
-    if coverage < 0.5:
+    if snack is not None:
+        pct_map = snack
+        source_note = "label+nutrition"
+    elif coverage < 0.5:
         nutrients = {
             **(usda.get("nutrients_per_100g") or {}),
             **(off.get("nutrients_per_100g") or {}),
@@ -478,10 +538,7 @@ def normalise_all(input_json: Path, output_csv: Path) -> None:
         rows = normalise_product(raw)
         if rows:
             all_rows.extend(rows)
-            n_estimated = sum(1 for r in rows if r["Source"] == "estimated")
-            n_total = len(rows)
-            print(f"  ✓ {n_total} ingredients  "
-                  f"({n_total - n_estimated} from label, {n_estimated} estimated)")
+            print(f"  ✓ {len(rows)} ingredients  (percentages: {rows[0]['Source']})")
         else:
             failed.append(name)
             print(f"  ✗ Failed")
