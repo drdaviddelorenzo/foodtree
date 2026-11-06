@@ -1,12 +1,14 @@
 """Stage 1: fetch ingredient and nutrient data from Open Food Facts (and USDA, optionally).
 
-    python fetch.py --input products.csv --output raw_products.json
+    python fetch.py --input products.csv --output raw_products.json [--name-search]
 
-products.csv has two columns: barcode, product_name.
+products.csv has two columns: barcode, product_name. Products are looked up by barcode;
+a search by name is only made with --name-search, and its match is recorded and reported.
 """
 
 import argparse
 import csv
+import datetime
 import json
 import os
 import sys
@@ -22,7 +24,7 @@ USDA_SEARCH_URL  = "https://api.nal.usda.gov/fdc/v1/foods/search"
 USDA_DETAIL_URL  = "https://api.nal.usda.gov/fdc/v1/food/{fdc_id}"
 
 OFF_FIELDS = (
-    "product_name,brands,ingredients,ingredients_tags,ingredients_text,"
+    "code,product_name,brands,ingredients,ingredients_tags,ingredients_text,"
     "ingredients_text_en,nutriments,quantity"
 )
 
@@ -43,11 +45,13 @@ USDA_NUTRIENT_MAP = {
 }
 
 
-def _off_extract(product: dict, product_name: str) -> dict:
+def _off_extract(product: dict, product_name: str, matched_by: str) -> dict:
     """Extract the fields we need from an OFF product dict."""
     n = product.get("nutriments", {})
     return {
         "product_name": product_name,
+        "matched_by": matched_by,
+        "off_code": product.get("code", ""),
         "off_product_name": product.get("product_name", ""),
         "off_brands": product.get("brands", ""),
         "ingredients_raw_text": (
@@ -101,7 +105,7 @@ def fetch_off_by_barcode(barcode: str, product_name: str) -> dict | None:
     if data.get("status") == 1 and "product" in data:
         p = data["product"]
         if p.get("ingredients") or p.get("ingredients_tags") or p.get("ingredients_text"):
-            return _off_extract(p, product_name)
+            return _off_extract(p, product_name, "barcode")
     return None
 
 
@@ -120,7 +124,7 @@ def fetch_off_by_name(product_name: str) -> dict | None:
     products = resp.json().get("products", [])
     for p in products:
         if p.get("ingredients") or p.get("ingredients_tags"):
-            return _off_extract(p, product_name)
+            return _off_extract(p, product_name, "name_search")
     return None
 
 
@@ -212,10 +216,12 @@ def fetch_usda(barcode: str, product_name: str, api_key: str) -> dict | None:
     return None
 
 
-def fetch_product(barcode: str, product_name: str, usda_key: str) -> dict:
+def fetch_product(barcode: str, product_name: str, usda_key: str,
+                  name_search: bool = False) -> dict:
     result = {
         "product_name": product_name,
         "barcode": barcode,
+        "retrieved_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "off_data": None,
         "usda_data": None,
     }
@@ -224,18 +230,28 @@ def fetch_product(barcode: str, product_name: str, usda_key: str) -> dict:
     if barcode:
         print(f"  [OFF] barcode {barcode}...", end=" ", flush=True)
         off_data = fetch_off_by_barcode(barcode, product_name)
+        if off_data is None:
+            print("✗ not found")
 
-    if off_data is None:
+    if off_data is None and name_search:
         print(f"  [OFF] name search '{product_name}'...", end=" ", flush=True)
         off_data = fetch_off_by_name(product_name)
+        if off_data:
+            print(f"matched {off_data['off_code'] or '(no code)'} "
+                  f"'{off_data['off_brands']} {off_data['off_product_name']}'. "
+                  "Check that this is the intended product.", end=" ")
+    elif off_data is None:
+        reason = "barcode not found" if barcode else "no barcode"
+        print(f"  [OFF] {reason}: skipped (use --name-search, or add it with --manual "
+              "at the normalise stage)")
 
     if off_data:
         n_ings = len(off_data.get("ingredients", []))
         n_tags = len(off_data.get("ingredients_tags", []))
         print(f"✓  ({n_ings} ingredients, {n_tags} tags)")
         result["off_data"] = off_data
-    else:
-        print(f"✗ not found")
+    elif name_search:
+        print("✗ not found")
 
     if usda_key and usda_key != "DEMO_KEY":
         print(f"  [USDA] searching '{product_name}'...", end=" ", flush=True)
@@ -251,7 +267,8 @@ def fetch_product(barcode: str, product_name: str, usda_key: str) -> dict:
     return result
 
 
-def fetch_all(products_csv: Path, output_json: Path, usda_key: str) -> list[dict]:
+def fetch_all(products_csv: Path, output_json: Path, usda_key: str,
+              name_search: bool = False) -> list[dict]:
     products = []
     with open(products_csv) as f:
         reader = csv.DictReader(f)
@@ -269,7 +286,7 @@ def fetch_all(products_csv: Path, output_json: Path, usda_key: str) -> list[dict
     results = []
     for i, p in enumerate(products, 1):
         print(f"[{i}/{len(products)}] {p['product_name']}")
-        data = fetch_product(p["barcode"], p["product_name"], usda_key)
+        data = fetch_product(p["barcode"], p["product_name"], usda_key, name_search)
         results.append(data)
         time.sleep(0.5)
 
@@ -278,9 +295,13 @@ def fetch_all(products_csv: Path, output_json: Path, usda_key: str) -> list[dict
         json.dump(results, f, indent=2, ensure_ascii=False)
 
     off_found  = sum(1 for r in results if r["off_data"])
+    by_name = [r["product_name"] for r in results
+               if r["off_data"] and r["off_data"].get("matched_by") == "name_search"]
     usda_found = sum(1 for r in results if r["usda_data"])
     print(f"\n✓ Raw data saved to {output_json}")
     print(f"  OFF data:  {off_found}/{len(results)}")
+    if by_name:
+        print(f"  Matched by name search, not barcode (check them): {', '.join(by_name)}")
     print(f"  USDA data: {usda_found}/{len(results)}")
     return results
 
@@ -293,9 +314,11 @@ def main():
                         help="Output path for raw_products.json")
     parser.add_argument("--usda-key", default=USDA_API_KEY,
                         help="USDA FoodData Central API key")
+    parser.add_argument("--name-search", action="store_true",
+                        help="Search Open Food Facts by name when a barcode is missing or not found")
     args = parser.parse_args()
 
-    fetch_all(Path(args.input), Path(args.output), args.usda_key)
+    fetch_all(Path(args.input), Path(args.output), args.usda_key, args.name_search)
 
 
 if __name__ == "__main__":

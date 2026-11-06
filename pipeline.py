@@ -68,7 +68,7 @@ def prompt_min_pct(foods_csv: Path, default: float = 2.0) -> float:
 def prompt_distance(default: str = "braycurtis") -> str:
     """Ask the user which distance metric to use, with a short description of each."""
     options = {
-        "1": ("braycurtis", "Bray-Curtis  — differences in raw amounts (default, works for most foods)"),
+        "1": ("braycurtis", "Bray-Curtis  — share of the composition two products do not have in common (default)"),
         "2": ("aitchison",  "Aitchison    — differences in ratios (better for trace ingredients: caffeine, vitamins)"),
         "3": ("jaccard",    "Jaccard      — presence/absence only, ignores quantities entirely"),
         "4": ("euclidean",  "Euclidean    — raw percentage differences, dominated by the largest ingredient"),
@@ -104,28 +104,43 @@ def prompt_distance(default: str = "braycurtis") -> str:
     return chosen
 
 
-def run_fetch(products_csv: Path, output_dir: Path, usda_key: str) -> Path:
+def run_fetch(products_csv: Path, output_dir: Path, usda_key: str,
+              name_search: bool = False) -> Path:
     from fetch import fetch_all
     output_json = output_dir / "raw_products.json"
-    fetch_all(products_csv=products_csv, output_json=output_json, usda_key=usda_key)
+    fetch_all(products_csv=products_csv, output_json=output_json, usda_key=usda_key,
+              name_search=name_search)
     return output_json
 
 
-def run_normalise(output_dir: Path) -> Path:
-    from normalise import normalise_all
+def run_normalise(output_dir: Path, manual_csv: Path | None = None,
+                  allow_missing: bool = False, moisture: str | None = None,
+                  allow_inconsistent: bool = False) -> Path:
+    from normalise import normalise_all, parse_moisture
     input_json = output_dir / "raw_products.json"
     output_csv = output_dir / "foods.csv"
     if not input_json.exists():
         print(f"Error: {input_json} not found. Run fetch stage first.", file=sys.stderr)
         sys.exit(1)
-    normalise_all(input_json=input_json, output_csv=output_csv)
+    normalise_all(input_json=input_json, output_csv=output_csv, manual_csv=manual_csv,
+                  allow_missing=allow_missing, moisture=parse_moisture(moisture),
+                  allow_inconsistent=allow_inconsistent)
     return output_csv
+
+
+def read_omitted(output_dir: Path) -> list[str]:
+    from normalise import omitted_path
+    path = omitted_path(output_dir / "foods.csv")
+    if not path.exists():
+        return []
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
 def run_render(output_dir: Path, analysis_name: str, method: str,
                metric: str,
                outgroup: str | None = None,
-               min_pct: float = 2.0) -> None:
+               min_pct: float = 2.0,
+               export_data: bool = True) -> None:
     from render import render_all
     foods_csv = output_dir / "foods.csv"
     if not foods_csv.exists():
@@ -139,6 +154,7 @@ def run_render(output_dir: Path, analysis_name: str, method: str,
         metric=metric,
         outgroup=outgroup,
         min_pct=min_pct,
+        export_data=export_data,
     )
 
 
@@ -151,8 +167,10 @@ def add_common_args(p):
 
 
 def add_render_args(p):
-    p.add_argument("--method", choices=["upgma", "nj"], default="upgma",
+    p.add_argument("--method", choices=["upgma", "nj", "both"], default="upgma",
                    help="Tree algorithm (default: upgma)")
+    p.add_argument("--no-export", action="store_true",
+                   help="Do not write the tree data files (Newick, JSON, distance CSV)")
     p.add_argument("--distance",
                    choices=["braycurtis", "aitchison", "euclidean", "jaccard"],
                    default=None,
@@ -162,6 +180,26 @@ def add_render_args(p):
     p.add_argument("--min-pct", type=float, default=None,
                    help="Drop ingredients whose max across all products is below this %% "
                         "(default: 2.0, or prompted interactively). Use 0 to keep everything.")
+
+
+def add_fetch_args(p):
+    p.add_argument("--name-search", action="store_true",
+                   help="Search Open Food Facts by name when a barcode is missing or not found")
+
+
+def add_manual_arg(p):
+    p.add_argument("--manual", default=None,
+                   help="CSV of products entered by hand (FoodItem, Ingredient, Percentage"
+                        "[, Category, Source])")
+    p.add_argument("--allow-missing", action="store_true",
+                   help="Leave out products without usable data instead of stopping "
+                        "(they are listed in foods-omitted.txt and run-config.txt)")
+    p.add_argument("--moisture", default=None,
+                   help="Water of the finished products, g per 100 g, as LO-HI (e.g. 1-4 for "
+                        "crisps); by default it is left to the nutrition table")
+    p.add_argument("--allow-inconsistent", action="store_true",
+                   help="Keep products whose label no composition satisfies, using the "
+                        "least-violating composition")
 
 
 def build_parser():
@@ -177,13 +215,17 @@ def build_parser():
     add_render_args(run_p)
     run_p.add_argument("--input", required=True, help="products.csv path")
     run_p.add_argument("--name", required=True, help="Analysis name (e.g. 'Crisps')")
+    add_fetch_args(run_p)
+    add_manual_arg(run_p)
 
     fetch_p = sub.add_parser("fetch", help="Stage 1 only: fetch product data")
     add_common_args(fetch_p)
     fetch_p.add_argument("--input", required=True, help="products.csv path")
+    add_fetch_args(fetch_p)
 
     norm_p = sub.add_parser("normalise", help="Stage 2 only: normalise ingredients")
     add_common_args(norm_p)
+    add_manual_arg(norm_p)
 
     rend_p = sub.add_parser("render", help="Stage 3 only: generate trees and heatmaps")
     add_common_args(rend_p)
@@ -210,8 +252,20 @@ def save_run_config(output_dir: Path, args, min_pct: float) -> None:
     cmd_parts.append(f"--min-pct {min_pct}")
     if hasattr(args, "outgroup") and args.outgroup:
         cmd_parts.append(f"--outgroup \"{args.outgroup}\"")
+    if getattr(args, "name_search", False):
+        cmd_parts.append("--name-search")
+    if getattr(args, "manual", None):
+        cmd_parts.append(f"--manual {args.manual}")
+    if getattr(args, "allow_missing", False):
+        cmd_parts.append("--allow-missing")
+    if getattr(args, "moisture", None):
+        cmd_parts.append(f"--moisture {args.moisture}")
+    if getattr(args, "allow_inconsistent", False):
+        cmd_parts.append("--allow-inconsistent")
+    if getattr(args, "no_export", False):
+        cmd_parts.append("--no-export")
 
-    cmd = " \\\n    ".join(cmd_parts)
+    cmd =" \\\n    ".join(cmd_parts)
 
     lines = [
         "=" * 60,
@@ -234,6 +288,8 @@ def save_run_config(output_dir: Path, args, min_pct: float) -> None:
     lines.append(f"  Min pct    : {min_pct}%")
     if hasattr(args, "outgroup") and args.outgroup:
         lines.append(f"  Outgroup   : {args.outgroup}")
+    omitted = read_omitted(output_dir)
+    lines.append(f"  Omitted    : {', '.join(omitted) if omitted else 'none'}")
     lines += [
         "",
         "Equivalent command:",
@@ -262,9 +318,10 @@ def main():
         print(f"  FoodTree — {args.name}")
         print("=" * 60)
         print("\n▶ Stage 1: Fetch")
-        run_fetch(Path(args.input), output_dir, args.usda_key)
+        run_fetch(Path(args.input), output_dir, args.usda_key, args.name_search)
         print("\n▶ Stage 2: Normalise")
-        run_normalise(output_dir)
+        run_normalise(output_dir, Path(args.manual) if args.manual else None,
+                      args.allow_missing, args.moisture, args.allow_inconsistent)
         min_pct = args.min_pct
         if min_pct is None:
             min_pct = prompt_min_pct(output_dir / "foods.csv")
@@ -273,7 +330,8 @@ def main():
             distance = prompt_distance()
         print("\n▶ Stage 3: Render")
         run_render(output_dir, args.name, args.method, distance,
-                   outgroup=args.outgroup, min_pct=min_pct)
+                   outgroup=args.outgroup, min_pct=min_pct,
+                   export_data=not args.no_export)
         args.distance = distance
         save_run_config(output_dir, args, min_pct)
         print("\n" + "=" * 60)
@@ -281,10 +339,11 @@ def main():
         print("=" * 60)
 
     elif args.command == "fetch":
-        run_fetch(Path(args.input), output_dir, args.usda_key)
+        run_fetch(Path(args.input), output_dir, args.usda_key, args.name_search)
 
     elif args.command == "normalise":
-        run_normalise(output_dir)
+        run_normalise(output_dir, Path(args.manual) if args.manual else None,
+                      args.allow_missing, args.moisture, args.allow_inconsistent)
 
     elif args.command == "render":
         min_pct = args.min_pct
@@ -294,7 +353,8 @@ def main():
         if distance is None:
             distance = prompt_distance()
         run_render(output_dir, args.name, args.method, distance,
-                   outgroup=args.outgroup, min_pct=min_pct)
+                   outgroup=args.outgroup, min_pct=min_pct,
+                   export_data=not args.no_export)
         args.distance = distance
         save_run_config(output_dir, args, min_pct)
 

@@ -1,10 +1,14 @@
 """Stage 3: build trees (UPGMA or Neighbor Joining) and ingredient heatmaps from foods.csv.
 
-    python render.py --input foods.csv --output analyses/crisps/ --name "Crisps" [--method nj] [--distance braycurtis]
+    python render.py --input foods.csv --output analyses/crisps/ --name "Crisps" [--method upgma|nj|both] [--distance braycurtis]
 """
 
 import argparse
+import datetime
 import json
+import os
+import shutil
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -59,11 +63,13 @@ def load_foods(csv_path: Path,
     df["Percentage"] = pd.to_numeric(df["Percentage"], errors="coerce").fillna(0)
 
     pivot = df.pivot_table(
-        index="FoodItem", columns="Ingredient", values="Percentage", aggfunc="mean"
+        index="FoodItem", columns="Ingredient", values="Percentage", aggfunc="sum"
     ).fillna(0)
 
-    # Ensure rows sum to 100
     row_sums = pivot.sum(axis=1)
+    empty = row_sums[row_sums <= 0].index.tolist()
+    if empty:
+        raise ValueError(f"No ingredient percentages for: {', '.join(empty)}")
     pivot = pivot.div(row_sums, axis=0) * 100
 
     if min_pct > 0:
@@ -73,6 +79,10 @@ def load_foods(csv_path: Path,
         if dropped:
             print(f"  Dropped {dropped} ingredient(s) with max < {min_pct}% "
                   f"({len(pivot.columns)} remaining)")
+        empty = pivot.index[pivot.sum(axis=1) <= 0].tolist()
+        if empty:
+            raise ValueError(f"No ingredient left after --min-pct {min_pct} for: "
+                             f"{', '.join(empty)}. Lower --min-pct.")
 
     meta = pd.DataFrame()
     if "Category" in df.columns:
@@ -121,7 +131,12 @@ def build_distance_matrix(pivot: pd.DataFrame, metric: str) -> np.ndarray:
         raise ValueError(f"Unknown distance metric '{metric}'. "
                          f"Choose from: {list(DISTANCE_FUNCTIONS)}")
     dist = fn(pivot)
-    dist = np.nan_to_num(dist, nan=0.0, posinf=1.0, neginf=0.0)
+    if not np.all(np.isfinite(dist)):
+        labels = pivot.index.tolist()
+        full = squareform(dist, checks=False)
+        bad = [f"{labels[i]} / {labels[j]}" for i in range(len(labels))
+               for j in range(i + 1, len(labels)) if not np.isfinite(full[i, j])]
+        raise ValueError(f"Undefined {metric} distance for: {'; '.join(bad)}")
     return dist
 
 
@@ -159,11 +174,10 @@ def render_upgma(pivot: pd.DataFrame, output_path: Path, title: str,
         lbl.set_fontweight("bold" if is_og else "normal")
 
     ax.set_xlabel(f"Distance ({metric})", color=STYLE["fg"], fontsize=10)
-    subtitle = f"UPGMA · {metric}" + (" · outgroup rooted" if outgroup else "")
-    ax.set_title(f"{title}\nIngredient Similarity Tree ({subtitle})",
+    ax.set_title(f"{title}\nIngredient Similarity Tree (UPGMA · {metric})",
                  color=STYLE["accent"], fontsize=13, pad=14, fontweight="bold")
     if outgroup:
-        fig.text(0.02, 0.01, f"◆ outgroup (reference): {outgroup}",
+        fig.text(0.02, 0.01, f"◆ reference (highlighted; UPGMA is not rooted on it): {outgroup}",
                  color=STYLE["accent"], fontsize=8, va="bottom")
     fig.text(0.98, 0.02, "FoodTree", color=STYLE["grid"], fontsize=8,
              ha="right", va="bottom", fontstyle="italic")
@@ -318,10 +332,12 @@ def _newick(node: dict) -> str:
 
 
 def export_tree_data(pivot: pd.DataFrame, metric: str, outgroup: str | None,
-                     output_dir: Path, slug: str, analysis_name: str) -> None:
-    """Write both trees as Newick and JSON, and the distance matrix as CSV, to redraw them elsewhere."""
-    trees = {"upgma": _upgma_dict(pivot, metric),
-             "nj": _clade_dict(build_nj_tree(pivot, metric, outgroup).root)}
+                     output_dir: Path, slug: str, analysis_name: str,
+                     methods: tuple[str, ...] = ("upgma", "nj")) -> None:
+    """Write the trees as Newick and JSON, and the distance matrix as CSV, to redraw them elsewhere."""
+    builders = {"upgma": lambda: _upgma_dict(pivot, metric),
+                "nj": lambda: _clade_dict(build_nj_tree(pivot, metric, outgroup).root)}
+    trees = {m: builders[m]() for m in methods}
     for method, tree in trees.items():
         base = output_dir / f"{slug}-tree-{method}-{metric}"
         info = {"analysis": analysis_name, "method": method, "distance": metric,
@@ -473,11 +489,124 @@ def render_distance_matrix(pivot: pd.DataFrame, output_path: Path,
     print(f"  ✓ Distance matrix → {output_path.name}")
 
 
+MANIFEST_HEADER = "Files written by this run:"
+
+
+def output_files(slug: str, metric: str, methods: tuple[str, ...], export_data: bool) -> list[str]:
+    """Names of the files one render writes for this analysis and metric."""
+    files = [f"{slug}-tree-{m}-{metric}.png" for m in methods]
+    if export_data:
+        files += [f"{slug}-tree-{m}-{metric}{ext}" for m in methods for ext in (".json", ".nwk")]
+        files.append(f"{slug}-distance-{metric}.csv")
+    files += [f"{slug}-distance-{metric}.png", f"{slug}-heatmap-{metric}.png",
+              f"{slug}-table-{metric}.csv"]
+    return files
+
+
+def manifest_path(output_dir: Path, slug: str, metric: str) -> Path:
+    return output_dir / f"{slug}-{metric}-outputs.txt"
+
+
+def read_manifest(path: Path) -> list[str]:
+    """Files listed by an earlier render's manifest (empty if there is none)."""
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if MANIFEST_HEADER not in lines:
+        return []
+    return [line.strip() for line in lines[lines.index(MANIFEST_HEADER) + 1:] if line.strip()]
+
+
+def write_manifest(path: Path, files: list[str], settings: dict) -> None:
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"FoodTree render, {ts}"] + [f"{k}: {v}" for k, v in settings.items()]
+    lines += ["", MANIFEST_HEADER] + [f"  {f}" for f in files]
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def publish_outputs(tmp_dir: Path, output_dir: Path, files: list[str], slug: str,
+                    metric: str, settings: dict) -> None:
+    """Move a finished render and its manifest into place, then delete the files that the
+    previous render of this analysis and metric listed and this render did not write.
+
+    Files being replaced or removed are first moved aside; if any step fails they are put
+    back, so the folder holds either the previous render or the new one. If some cannot be
+    put back, the copies are kept in a .foodtree-recovery-<time> folder and an error says so.
+    """
+    manifest = manifest_path(output_dir, slug, metric)
+    previous = set(read_manifest(manifest))
+    owned = previous & set(output_files(slug, metric, ("upgma", "nj"), True))
+    obsolete = sorted(owned - set(files))
+    backup = tmp_dir / ".previous"
+    backup.mkdir()
+    moved_aside: list[str] = []
+    placed: list[str] = []
+    try:
+        for name in obsolete:
+            if (output_dir / name).exists():
+                os.replace(output_dir / name, backup / name)
+                moved_aside.append(name)
+        for name in files + [manifest.name]:
+            dest = output_dir / name
+            if dest.exists():
+                if name not in previous and name != manifest.name:
+                    print(f"  Overwriting {name} (not listed by a previous render)")
+                os.replace(dest, backup / name)
+                moved_aside.append(name)
+            if name == manifest.name:
+                write_manifest(manifest, files, settings)
+            else:
+                os.replace(tmp_dir / name, dest)
+            placed.append(name)
+    except BaseException as exc:
+        unrestored = []
+        for name in placed:
+            try:
+                (output_dir / name).unlink(missing_ok=True)
+            except OSError:
+                unrestored.append(name)
+        for name in moved_aside:
+            try:
+                os.replace(backup / name, output_dir / name)
+            except OSError:
+                unrestored.append(name)
+        if unrestored:
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            keep = output_dir / f".foodtree-recovery-{stamp}"
+            try:
+                os.replace(backup, keep)
+                where, keep_tmp = keep, False
+            except OSError:
+                where, keep_tmp = backup, True
+            raise RecoveryNeeded(
+                f"Publishing failed ({exc}) and these files could not be put back: "
+                f"{', '.join(unrestored)}. The previous versions are in {where}.",
+                keep_tmp) from exc
+        raise
+    for name in moved_aside:
+        if name in obsolete:
+            print(f"  Removed {name} (written by the previous render, not by this one)")
+
+
+class RecoveryNeeded(RuntimeError):
+    """Publishing failed and previous outputs are kept for manual recovery."""
+
+    def __init__(self, message: str, keep_tmp: bool):
+        super().__init__(message)
+        self.keep_tmp = keep_tmp
+
+
 def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
                method: str = "upgma", metric: str = "braycurtis",
                outgroup: str | None = None,
                min_pct: float = 2.0, export_data: bool = True) -> None:
-    """Render both trees, distance matrix, heatmap and table, and export the tree data."""
+    """Render the trees, distance matrix, heatmap and table, and export the tree data.
+
+    Files are written to a temporary folder and moved into output_dir only when all of them
+    have been produced, so a failed render leaves the previous outputs untouched.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     slug = analysis_name.lower().replace(" ", "-")
 
@@ -492,40 +621,64 @@ def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
             print(f"  WARNING: outgroup '{outgroup}' not found in foods.csv — ignored")
             outgroup = None
 
-    print("\nRendering trees...")
-    leaf_order = get_upgma_leaf_order(pivot, metric)
+    methods = ("upgma", "nj") if method == "both" else (method,)
+    if any(m not in ("upgma", "nj") for m in methods):
+        raise ValueError(f"Unknown method '{method}'. Choose from: upgma, nj, both")
+    files = output_files(slug, metric, methods, export_data)
 
-    render_upgma(pivot, output_dir / f"{slug}-tree-upgma-{metric}.png",
-                 analysis_name, metric, outgroup=outgroup)
-    render_nj(pivot, output_dir / f"{slug}-tree-nj-{metric}.png",
-              analysis_name, metric, outgroup=outgroup)
+    tmp_dir = Path(tempfile.mkdtemp(prefix=".foodtree-render-", dir=output_dir))
+    keep_tmp = False
+    try:
+        print("\nRendering trees...")
+        leaf_order = get_upgma_leaf_order(pivot, metric)
 
-    if export_data:
-        print("\nExporting tree data...")
-        export_tree_data(pivot, metric, outgroup, output_dir, slug, analysis_name)
+        if "upgma" in methods:
+            render_upgma(pivot, tmp_dir / f"{slug}-tree-upgma-{metric}.png",
+                         analysis_name, metric, outgroup=outgroup)
+        if "nj" in methods:
+            render_nj(pivot, tmp_dir / f"{slug}-tree-nj-{metric}.png",
+                      analysis_name, metric, outgroup=outgroup)
 
-    print("\nRendering distance matrix...")
-    render_distance_matrix(pivot,
-                           output_dir / f"{slug}-distance-{metric}.png",
-                           analysis_name, metric, leaf_order=leaf_order)
+        if export_data:
+            print("\nExporting tree data...")
+            export_tree_data(pivot, metric, outgroup, tmp_dir, slug, analysis_name, methods)
 
-    key_ings = get_key_ingredients(pivot, meta)
+        print("\nRendering distance matrix...")
+        render_distance_matrix(pivot,
+                               tmp_dir / f"{slug}-distance-{metric}.png",
+                               analysis_name, metric, leaf_order=leaf_order)
 
-    print(f"\nRendering ingredient overview...")
-    render_heatmap_combined(
-        pivot, key_ings,
-        output_dir / f"{slug}-heatmap.png",
-        analysis_name, leaf_order,
-    )
+        key_ings = get_key_ingredients(pivot, meta)
 
-    print(f"\nSaving ingredient table (CSV)...")
-    render_table(
-        pivot, pivot.columns.tolist(),
-        output_dir / f"{slug}-table.png",
-        analysis_name, leaf_order,
-    )
+        print(f"\nRendering ingredient overview...")
+        render_heatmap_combined(
+            pivot, key_ings,
+            tmp_dir / f"{slug}-heatmap-{metric}.png",
+            analysis_name, leaf_order,
+        )
 
-    print(f"\n✓ All assets saved to {output_dir}/")
+        print(f"\nSaving ingredient table (CSV)...")
+        render_table(
+            pivot, pivot.columns.tolist(),
+            tmp_dir / f"{slug}-table-{metric}.csv",
+            analysis_name, leaf_order,
+        )
+
+        missing = [f for f in files if not (tmp_dir / f).exists()]
+        if missing:
+            raise RuntimeError(f"Render did not produce: {', '.join(missing)}")
+        publish_outputs(tmp_dir, output_dir, files, slug, metric, {
+            "input": foods_csv, "method": method, "distance": metric, "min_pct": min_pct,
+            "outgroup": outgroup or "none", "export": export_data,
+            "products": len(pivot), "ingredients": len(pivot.columns),
+        })
+    except RecoveryNeeded as exc:
+        keep_tmp = exc.keep_tmp
+        raise
+    finally:
+        if not keep_tmp:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(f"\n✓ All assets saved to {output_dir}/ (list in {slug}-{metric}-outputs.txt)")
 
 
 def main():
@@ -533,7 +686,7 @@ def main():
     parser.add_argument("--input", required=True, help="Path to foods.csv")
     parser.add_argument("--output", required=True, help="Output directory for PNGs")
     parser.add_argument("--name", required=True, help="Analysis name (e.g. 'Crisps')")
-    parser.add_argument("--method", choices=["upgma", "nj"], default="upgma",
+    parser.add_argument("--method", choices=["upgma", "nj", "both"], default="upgma",
                         help="Tree algorithm (default: upgma)")
     parser.add_argument("--distance",
                         choices=list(DISTANCE_FUNCTIONS), default="braycurtis",
