@@ -23,16 +23,6 @@ Your input is a CSV with `barcode,product_name` (see `examples/products_crisps.c
 
 The tree data is exported too, so you can redraw the trees in your own style: Newick (`*-tree-*.nwk`), JSON with branch lengths and depths (`*-tree-*.json`) and the distance matrix (`*-distance-*.csv`). Use `--no-export` to skip them.
 
-## Chocolate example
-
-`examples/chocolate_tree.py` builds a tree of ten chocolate bars from a label profile of three numbers per bar: the declared cocoa and the total sugars of the nutrition table (Open Food Facts), which can overlap slightly because cocoa carries some sugars of its own, and a remainder calculated as 100 minus both, which is not a measured share. It does not use the ingredient estimator of the main pipeline.
-
-```bash
-python examples/chocolate_tree.py examples/products_chocolate.csv
-```
-
-It prints the profile of each bar and the tree in Newick format. A row with an empty barcode (the two store brands) takes `cocoa` and `sugars` from the CSV and downloads nothing. The script needs all ten products: if one cannot be obtained, it lists which and exits with an error without drawing a tree.
-
 ## Options
 
 `--method upgma|nj` (tree algorithm), `--distance braycurtis|aitchison|euclidean|jaccard`, `--outgroup`, `--min-pct` (ignore ingredients below this percentage).
