@@ -84,3 +84,12 @@ def test_order_rule_allows_small_ingredients_out_of_order():
     u, mass = np.array([60.0, 30.0, 1.0, 1.5]), np.array([60.0, 30.0, 1.0, 1.5])
     assert estimate._order_ok(u, mass)
     assert not estimate._order_ok(np.array([30.0, 60.0]), np.array([30.0, 60.0]))
+
+
+def test_non_finite_values_count_as_not_declared():
+    assert estimate.nutrient_value({"fat_g": float("nan")}, "fat") is None
+    assert estimate.nutrient_value({"salt_g": None, "sodium_g": float("inf")}, "salt") is None
+    off = {"ingredients": [{"id": "en:salt", "text": "salt", "percent": "NaN"}],
+           "ingredients_raw_text": "salt"}
+    items, _ = estimate.top_level_items(off, lambda ing: "salt")
+    assert items[0].declared is None

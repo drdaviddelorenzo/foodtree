@@ -96,7 +96,11 @@ def test_snapshot_is_checked_before_replacing(tmp_path):
                                  '[{"product_name": "X", "off_data": {"ingredients": "bad"}}]',
                                  '[{"product_name": "X", "off_data": {"ingredients": '
                                  '[{"id": "en:salt", "ingredients": ["bad"]}]}}]',
-                                 '[{"product_name": "X", "usda_data": {"usda_description": 3}}]']):
+                                 '[{"product_name": "X", "usda_data": {"usda_description": 3}}]',
+                                 '[{"product_name": "X", "off_data": {"ingredients": '
+                                 '[{"id": "en:salt", "percent": "NaN"}]}}]',
+                                 '[{"product_name": "X", "off_data": {"nutrients_per_100g": '
+                                 '{"fat_g": "Infinity"}}}]']):
         broken = tmp_path / f"broken{k}.json"
         broken.write_text(content)
         out = subprocess.run([sys.executable, "pipeline.py", "run", "--snapshot", str(broken),

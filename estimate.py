@@ -39,6 +39,7 @@ standard deviations wide on each side).
 """
 
 import csv
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -159,7 +160,7 @@ def top_level_items(off: dict, name_of) -> tuple[list[Item], list[str]]:
         subs = tuple(s.get("id", "") for s in ing.get("ingredients") or [])
         if k == keep - 1 and keep < len(ings):
             subs += tuple(i.get("id", "") for i in ings[keep:])
-        pct = ing.get("percent")
+        pct = _finite(ing.get("percent"))
         items.append(Item(
             name=name_of(ing),
             off_id=ing.get("id", ""),
@@ -185,11 +186,22 @@ def tolerance_band(nutrient: str, value: float) -> tuple[float, float]:
 NUTRIENT_KEYS = {"fat": "fat_g", "carb": "carbohydrates_g", "protein": "protein_g", "salt": "salt_g"}
 
 
+def _finite(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) and f >= 0 else None
+
+
 def nutrient_value(nutrients: dict, nut: str) -> float | None:
-    v = nutrients.get(NUTRIENT_KEYS[nut])
-    if v is None and nut == "salt" and nutrients.get("sodium_g") is not None:
-        v = 2.5 * float(nutrients["sodium_g"])
-    return float(v) if v is not None else None
+    """A declared nutrient value; missing, non-numeric, negative or non-finite values count as
+    not declared."""
+    v = _finite(nutrients.get(NUTRIENT_KEYS[nut]))
+    if v is None and nut == "salt":
+        sodium = _finite(nutrients.get("sodium_g"))
+        v = 2.5 * sodium if sodium is not None else None
+    return v
 
 
 def nutrient_targets(nutrients: dict) -> dict[str, tuple[float, float]]:

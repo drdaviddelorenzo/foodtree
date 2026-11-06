@@ -9,6 +9,7 @@ Optional: export USDA_API_KEY to also use USDA FoodData Central.
 import argparse
 import datetime
 import json
+import math
 import os
 import shutil
 import sys
@@ -163,8 +164,8 @@ def _parse_problem(record: dict) -> str | None:
                 for key in ("id", "text", "processing"):
                     if ing.get(key) is not None and not isinstance(ing[key], str):
                         return f"ingredient field '{key}' should be a string"
-                if ing.get("percent") is not None:
-                    float(ing["percent"])
+                if ing.get("percent") is not None and not math.isfinite(float(ing["percent"])):
+                    return f"ingredient percent '{ing['percent']}' is not a finite number"
                 subs = ing.get("ingredients")
                 if subs is not None and not isinstance(subs, list):
                     return "sub-ingredients should be a list"
@@ -173,8 +174,9 @@ def _parse_problem(record: dict) -> str | None:
         elif off.get("ingredients_raw_text"):
             normalise._items_from_text(off["ingredients_raw_text"])
         for block in (record.get("usda_data") or {}, off):
-            estimate.nutrient_targets({k: v for k, v in (block.get("nutrients_per_100g") or {}).items()
-                                       if v is not None})
+            for key, v in (block.get("nutrients_per_100g") or {}).items():
+                if v is not None and not math.isfinite(float(v)):
+                    return f"nutrient {key} = {v} is not a finite number"
     except (AttributeError, TypeError, ValueError, KeyError) as exc:
         return f"cannot be parsed ({exc})"
     return None
