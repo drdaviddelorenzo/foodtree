@@ -32,7 +32,7 @@ COUNTRY_ALIASES = {
 
 def search_off(query: str | None, category: str | None,
                country: str | None, limit: int) -> list[dict]:
-    """Search OpenFoodFacts. Returns a list of product dicts with keys:"""
+    """Search Open Food Facts and return a list of product dicts."""
     fetch_size = min(limit * 3 if country else limit, 200)
 
     params = {

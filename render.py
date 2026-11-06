@@ -4,6 +4,7 @@
 """
 
 import argparse
+import json
 import warnings
 from pathlib import Path
 
@@ -12,7 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.cluster.hierarchy import linkage, dendrogram, to_tree
 from scipy.spatial.distance import pdist, squareform
 from Bio import Phylo
 from Bio.Phylo.TreeConstruction import DistanceMatrix, DistanceTreeConstructor
@@ -217,25 +218,26 @@ def _draw_nj_clade(ax, clade, parent_x: float,
     return node_y
 
 
-def render_nj(pivot: pd.DataFrame, output_path: Path, title: str,
-              metric: str, outgroup: str | None = None) -> None:
-    dist_condensed = build_distance_matrix(pivot, metric)
+def build_nj_tree(pivot: pd.DataFrame, metric: str, outgroup: str | None = None):
+    """Neighbor Joining tree, rooted on the outgroup if given, otherwise at the midpoint."""
     labels = pivot.index.tolist()
-    full = squareform(dist_condensed)
+    full = squareform(build_distance_matrix(pivot, metric))
     full = (full + full.T) / 2
     np.fill_diagonal(full, 0.0)
-
     dm = DistanceMatrix(names=labels)
     dm.matrix = [full[i, :i + 1].tolist() for i in range(len(labels))]
-
-    constructor = DistanceTreeConstructor()
-    tree = constructor.nj(dm)
-
-    # otherwise fall back to midpoint rooting
+    tree = DistanceTreeConstructor().nj(dm)
     if outgroup and outgroup in labels:
         tree.root_with_outgroup(outgroup)
     else:
         tree.root_at_midpoint()
+    return tree
+
+
+def render_nj(pivot: pd.DataFrame, output_path: Path, title: str,
+              metric: str, outgroup: str | None = None) -> None:
+    labels = pivot.index.tolist()
+    tree = build_nj_tree(pivot, metric, outgroup)
 
     leaf_order = _nj_leaf_order(tree.root)
     leaf_y = {name: i for i, name in enumerate(leaf_order)}
@@ -276,9 +278,65 @@ def render_nj(pivot: pd.DataFrame, output_path: Path, title: str,
     print(f"  ✓ NJ tree ({metric}) → {output_path.name}")
 
 
+def _node(name, branch_length: float, parent_depth: float) -> dict:
+    return {"name": name, "branch_length": round(branch_length, 6),
+            "depth": round(parent_depth + branch_length, 6)}
+
+
+def _upgma_dict(pivot: pd.DataFrame, metric: str) -> dict:
+    labels = pivot.index.tolist()
+    root = to_tree(linkage(build_distance_matrix(pivot, metric), method="average"))
+
+    def walk(n, parent_height: float, parent_depth: float) -> dict:
+        d = _node(labels[n.id] if n.is_leaf() else None,
+                  max(parent_height - n.dist, 0.0), parent_depth)
+        if not n.is_leaf():
+            d["children"] = [walk(n.left, n.dist, d["depth"]), walk(n.right, n.dist, d["depth"])]
+        return d
+
+    return walk(root, root.dist, 0.0)
+
+
+def _clade_dict(clade, parent_depth: float = 0.0) -> dict:
+    d = _node(clade.name if clade.is_terminal() else None,
+              clade.branch_length or 0.0, parent_depth)
+    if not clade.is_terminal():
+        d["children"] = [_clade_dict(c, d["depth"]) for c in clade.clades]
+    return d
+
+
+def _leaf_names(node: dict) -> list[str]:
+    if "children" not in node:
+        return [node["name"]]
+    return [name for c in node["children"] for name in _leaf_names(c)]
+
+
+def _newick(node: dict) -> str:
+    name = "".join(ch for ch in (node["name"] or "") if ch not in ",:;()[]").replace(" ", "_")
+    inner = "(" + ",".join(_newick(c) for c in node["children"]) + ")" if "children" in node else ""
+    return f"{inner}{name}:{node['branch_length']}"
+
+
+def export_tree_data(pivot: pd.DataFrame, metric: str, outgroup: str | None,
+                     output_dir: Path, slug: str, analysis_name: str) -> None:
+    """Write both trees as Newick and JSON, and the distance matrix as CSV, to redraw them elsewhere."""
+    trees = {"upgma": _upgma_dict(pivot, metric),
+             "nj": _clade_dict(build_nj_tree(pivot, metric, outgroup).root)}
+    for method, tree in trees.items():
+        base = output_dir / f"{slug}-tree-{method}-{metric}"
+        info = {"analysis": analysis_name, "method": method, "distance": metric,
+                "outgroup": outgroup, "leaf_order": _leaf_names(tree), "tree": tree}
+        base.with_suffix(".json").write_text(json.dumps(info, indent=2, ensure_ascii=False))
+        base.with_suffix(".nwk").write_text(_newick(tree) + ";\n")
+    labels = pivot.index.tolist()
+    matrix = pd.DataFrame(squareform(build_distance_matrix(pivot, metric)), index=labels, columns=labels)
+    matrix.round(6).to_csv(output_dir / f"{slug}-distance-{metric}.csv")
+    print(f"  ✓ Tree data (Newick + JSON) and distance matrix (CSV) → {slug}-tree-*.nwk/.json, {slug}-distance-{metric}.csv")
+
+
 def get_key_ingredients(pivot: pd.DataFrame, meta: pd.DataFrame,
                         max_ingredients: int = 8) -> list[str]:
-    """Select the most informative ingredients for the heatmap, in this order:"""
+    """Select the most informative ingredients for the heatmap."""
     if meta.empty:
         variances = pivot.var().sort_values(ascending=False)
         return variances.index.tolist()[:max_ingredients]
@@ -418,8 +476,8 @@ def render_distance_matrix(pivot: pd.DataFrame, output_path: Path,
 def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
                method: str = "upgma", metric: str = "braycurtis",
                outgroup: str | None = None,
-               min_pct: float = 2.0) -> None:
-    """Always produces:"""
+               min_pct: float = 2.0, export_data: bool = True) -> None:
+    """Render both trees, distance matrix, heatmap and table, and export the tree data."""
     output_dir.mkdir(parents=True, exist_ok=True)
     slug = analysis_name.lower().replace(" ", "-")
 
@@ -441,6 +499,10 @@ def render_all(foods_csv: Path, output_dir: Path, analysis_name: str,
                  analysis_name, metric, outgroup=outgroup)
     render_nj(pivot, output_dir / f"{slug}-tree-nj-{metric}.png",
               analysis_name, metric, outgroup=outgroup)
+
+    if export_data:
+        print("\nExporting tree data...")
+        export_tree_data(pivot, metric, outgroup, output_dir, slug, analysis_name)
 
     print("\nRendering distance matrix...")
     render_distance_matrix(pivot,
@@ -483,6 +545,8 @@ def main():
                              "(default: 2.0). Use 0 to keep everything. "
                              "Lower for analyses where key ingredients are trace amounts "
                              "(e.g. 0.1 for energy drinks to keep caffeine/taurine).")
+    parser.add_argument("--no-export", action="store_true",
+                        help="Do not write the tree data files (Newick, JSON, distance CSV)")
     args = parser.parse_args()
 
     render_all(
@@ -493,6 +557,7 @@ def main():
         metric=args.distance,
         outgroup=args.outgroup,
         min_pct=args.min_pct,
+        export_data=not args.no_export,
     )
 
 

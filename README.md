@@ -21,6 +21,8 @@ python pipeline.py run --input examples/products_crisps.csv --name "Crisps" --di
 
 Your input is a CSV with `barcode,product_name` (see `examples/products_crisps.csv`). `search.py "energy drinks"` helps to build one. Outputs (`raw_products.json`, `foods.csv`, tree and heatmap PNGs) are written to `--dir`.
 
+The tree data is exported too, so you can redraw the trees in your own style: Newick (`*-tree-*.nwk`), JSON with branch lengths and depths (`*-tree-*.json`) and the distance matrix (`*-distance-*.csv`). Use `--no-export` to skip them.
+
 ## Options
 
 `--method upgma|nj` (tree algorithm), `--distance braycurtis|aitchison|euclidean|jaccard`, `--outgroup`, `--min-pct` (ignore ingredients below this percentage).
