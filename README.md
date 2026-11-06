@@ -61,6 +61,13 @@ Each render also writes `<name>-diagnostics-<distance>.txt` with the cophenetic 
 
 Ingredient lists are what labels declare, and Open Food Facts is edited by its users: check the inputs before drawing conclusions. Composition ranges are generic and an ingredient whose class is unknown is left unconstrained, so bounds can be wide. Data licences: Open Food Facts (ODbL), USDA FoodData Central (public domain).
 
+## Reproducing and testing
+
+- **Without a connection.** `python pipeline.py run --snapshot examples/crisps/raw_products.json --name "Crisps" --dir analyses/crisps/ --moisture 1-4` reuses the saved records instead of fetching them, so a whole class can run the example without calling Open Food Facts.
+- **Same versions.** `requirements.txt` gives minimum versions; `requirements-lock.txt` pins the full environment the code was tested in (Python 3.12.9 on macOS, every package including dependencies). Use it for a course; on other platforms, run the tests to check that the results hold.
+- **Determinism.** Estimation and branch support use fixed seeds: the same inputs and versions give the same outputs.
+- **Tests.** `pip install pytest` and run `pytest` from the repository folder. `tests/test_example.py` re-runs the crisps example (about a minute) and checks its bounds and that the UniFrac tree recovers the maize and crisp families with high support.
+
 ## Licence
 
 Code: MIT, see `LICENSE`. Data in `examples/`: see the README in each example folder.

@@ -8,8 +8,11 @@ Optional: export USDA_API_KEY to also use USDA FoodData Central.
 
 import argparse
 import datetime
+import json
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import csv as _csv
@@ -112,6 +115,51 @@ def run_fetch(products_csv: Path, output_dir: Path, usda_key: str,
     fetch_all(products_csv=products_csv, output_json=output_json, usda_key=usda_key,
               name_search=name_search)
     return output_json
+
+
+def snapshot_problem(data) -> str | None:
+    """Why a raw_products.json cannot be normalised, or None if its structure is usable."""
+    if not isinstance(data, list) or not data:
+        return "expected a non-empty list of products"
+    optional = {"ingredients": list, "ingredients_raw_text": str, "nutrients_per_100g": dict}
+    for k, r in enumerate(data):
+        if not isinstance(r, dict):
+            return f"product {k} is not an object"
+        if not isinstance(r.get("product_name"), str) or not r["product_name"].strip():
+            return f"product {k} has no product_name"
+        for source in ("off_data", "usda_data"):
+            block = r.get(source)
+            if block is None:
+                continue
+            if not isinstance(block, dict):
+                return f"{r['product_name']}: {source} is not an object"
+            for key, kind in optional.items():
+                if block.get(key) is not None and not isinstance(block[key], kind):
+                    return f"{r['product_name']}: {source}.{key} should be a {kind.__name__}"
+            if any(not isinstance(i, dict) for i in block.get("ingredients") or []):
+                return f"{r['product_name']}: {source}.ingredients should hold objects"
+    return None
+
+
+def use_snapshot(snapshot: Path, target: Path) -> None:
+    """Copy a saved raw_products.json into the analysis folder, replacing the existing one
+    only after the copy has been checked. Each run uses its own temporary file."""
+    if snapshot.resolve() == target.resolve():
+        return
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        shutil.copyfile(snapshot, tmp)
+        problem = snapshot_problem(json.loads(tmp.read_text(encoding="utf-8")))
+        if problem:
+            raise ValueError(problem)
+        os.replace(tmp, target)
+    except (OSError, ValueError) as exc:
+        tmp.unlink(missing_ok=True)
+        print(f"Error: {snapshot} is not a usable raw_products.json ({exc}); "
+              f"{target.name} was left unchanged.", file=sys.stderr)
+        sys.exit(1)
 
 
 def run_normalise(output_dir: Path, manual_csv: Path | None = None,
@@ -223,7 +271,10 @@ def build_parser():
     run_p = sub.add_parser("run", help="Full pipeline: fetch + normalise + render")
     add_common_args(run_p)
     add_render_args(run_p)
-    run_p.add_argument("--input", required=True, help="products.csv path")
+    run_p.add_argument("--input", default=None, help="products.csv path")
+    run_p.add_argument("--snapshot", default=None,
+                       help="Use a saved raw_products.json (e.g. examples/crisps/raw_products.json) "
+                            "instead of fetching: no connection is needed")
     run_p.add_argument("--name", required=True, help="Analysis name (e.g. 'Crisps')")
     add_fetch_args(run_p)
     add_manual_arg(run_p)
@@ -252,6 +303,8 @@ def save_run_config(output_dir: Path, args, min_pct: float) -> None:
     cmd_parts = ["python pipeline.py", args.command]
     if hasattr(args, "input") and args.input:
         cmd_parts.append(f"--input {args.input}")
+    if getattr(args, "snapshot", None):
+        cmd_parts.append(f"--snapshot {args.snapshot}")
     if hasattr(args, "name") and args.name:
         cmd_parts.append(f"--name \"{args.name}\"")
     cmd_parts.append(f"--dir {args.dir}")
@@ -331,8 +384,17 @@ def main():
         print("=" * 60)
         print(f"  FoodTree — {args.name}")
         print("=" * 60)
-        print("\n▶ Stage 1: Fetch")
-        run_fetch(Path(args.input), output_dir, args.usda_key, args.name_search)
+        if bool(args.input) == bool(args.snapshot):
+            print("Error: give either --input (to fetch) or --snapshot (to reuse saved data).",
+                  file=sys.stderr)
+            sys.exit(1)
+        if args.snapshot:
+            print("\n▶ Stage 1: Fetch skipped (snapshot)")
+            use_snapshot(Path(args.snapshot), output_dir / "raw_products.json")
+            print(f"  Using {args.snapshot}")
+        else:
+            print("\n▶ Stage 1: Fetch")
+            run_fetch(Path(args.input), output_dir, args.usda_key, args.name_search)
         print("\n▶ Stage 2: Normalise")
         run_normalise(output_dir, Path(args.manual) if args.manual else None,
                       args.allow_missing, args.moisture, args.allow_inconsistent)

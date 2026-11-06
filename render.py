@@ -703,6 +703,13 @@ def compute_supports(foods_csv: Path, pivot: pd.DataFrame, metric: str, methods,
     if replicates is None:
         return {}, 0, 0, why
     raw = pd.read_csv(foods_csv)
+    if "Source" in raw.columns:
+        bad = sorted(set(raw.loc[raw["Source"] == "inconsistent-label", "FoodItem"])
+                     & set(pivot.index))
+        if bad:
+            return {}, 0, 0, ("these products have inconsistent labels and a single "
+                              f"least-violating composition, so support would be meaningless: "
+                              f"{', '.join(bad)}")
     point = raw.pivot_table(index="FoodItem", columns="Ingredient", values="Percentage",
                             aggfunc="sum").fillna(0)
     labels = pivot.index.tolist()
@@ -799,7 +806,8 @@ def write_diagnostics(path: Path, pivot: pd.DataFrame, metric: str, methods, sup
         lines.append(f"Branch support: not computed ({why}).")
     lines += ["", "Support measures robustness to what the labels leave undetermined. It does "
               "not cover errors in the labels, the ingredient tree, the distance or the tree "
-              "method."]
+              "method. Products entered by hand (--manual) are held at their values in every "
+              "replicate."]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

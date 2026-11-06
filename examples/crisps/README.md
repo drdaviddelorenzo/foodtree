@@ -8,10 +8,11 @@ Eleven snacks sold in Spain, the United Kingdom and France: five fried potato cr
 Run the analysis from the snapshot, without contacting Open Food Facts:
 
 ```bash
-mkdir -p analyses/crisps && cp examples/crisps/raw_products.json analyses/crisps/
-python pipeline.py normalise --dir analyses/crisps/ --moisture 1-4
-python pipeline.py render --dir analyses/crisps/ --name "Crisps" --min-pct 0 --distance braycurtis
+python pipeline.py run --snapshot examples/crisps/raw_products.json --name "Crisps" \
+    --dir analyses/crisps/ --moisture 1-4 --min-pct 0 --distance unifrac
 ```
+
+Use `--distance braycurtis` to compare with the published post, and `--method both` to add the Neighbor Joining tree.
 
 Or fetch the current records instead: `python pipeline.py run --input examples/crisps/products.csv --name "Crisps" --dir analyses/crisps/ --moisture 1-4`.
 
