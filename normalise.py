@@ -1,24 +1,28 @@
-"""Stage 2: turn raw product data into foods.csv (FoodItem, Ingredient, Percentage, Category, Source).
+"""Stage 2: turn raw product data into foods.csv
+(FoodItem, Ingredient, Percentage, PctLow, PctHigh, Category, Class, Source).
 
-    python normalise.py --input raw_products.json --output foods.csv
+    python normalise.py --input raw_products.json --output foods.csv [--moisture 1-4]
 
-Ingredient names are harmonised across languages and missing percentages are estimated
-from nutrition data. No LLM is used.
+Ingredient names are harmonised across languages. Percentages are estimated from the label
+(declared percentages, ingredient order and nutrition table) as described in estimate.py.
 """
 
 import csv
 import json
+import math
+import os
 import re
 import sys
-import warnings
 import argparse
 import unicodedata
 from pathlib import Path
 
-import numpy as np
-from scipy.optimize import minimize
+import hashlib
+import zlib
 
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="scipy")
+import numpy as np
+
+import estimate
 
 
 SYNONYMS: dict[str, str] = {
@@ -150,6 +154,7 @@ SYNONYMS: dict[str, str] = {
     "co2": "carbon_dioxide",
     "potato": "potato",
     "patata": "potato",
+    "dehydrated_potato": "dehydrated_potato",
     "tomato": "tomato",
     "tomate": "tomato",
     "corn": "corn",
@@ -157,13 +162,12 @@ SYNONYMS: dict[str, str] = {
     "maiz": "corn",
     "potatoes": "potato",
     "select_potatoes": "potato",
-    "dehydrated_potato": "potato",
-    "dehydrated_potatoes": "potato",
-    "dried_potato": "potato",
-    "cornmeal": "corn",
-    "corn_meal": "corn",
-    "maize_meal": "corn",
-    "maize_flour": "corn_flour",
+    "dehydrated_potatoes": "dehydrated_potato",
+    "dried_potato": "dehydrated_potato",
+    "potato_flakes": "dehydrated_potato",
+    "cornmeal": "cornmeal",
+    "corn_meal": "cornmeal",
+    "maize_meal": "cornmeal",
 }
 
 CATEGORIES: dict[str, str] = {
@@ -184,6 +188,9 @@ CATEGORIES: dict[str, str] = {
     "corn_starch": "base",       "potato_starch": "base",
     "rice_flour": "base",        "oat_flour": "base",
     "wheat_starch": "base",      "potato": "base",
+    "dehydrated_potato": "base", "potato_flour": "base",
+    "cornmeal": "base",          "corn_oil": "fat",
+    "residual_water": "water",
     "corn": "base",              "tomato": "base",
     "cod": "protein",            "alaska_pollock": "protein",
     "salmon": "protein",         "tuna": "protein",
@@ -260,322 +267,365 @@ def _is_label_text(name: str) -> bool:
     return bool(parts & _LABEL_TEXT_SIGNALS)
 
 
-def extract_percentages_from_off(ingredients: list[dict]) -> dict[str, float | None]:
-    """Extract percent_estimate values from OFF ingredient list."""
-    result = {}
-    for ing in ingredients:
-        name = canonical_name(ing.get("text", ""))
-        pct = ing.get("percent_estimate")
-        if pct is not None:
-            try:
-                result[name] = float(pct)
-            except (ValueError, TypeError):
-                result[name] = None
-        else:
-            result[name] = None
-    return result
+class InconsistentLabel(Exception):
+    """The label of a product cannot be satisfied by any composition."""
+
+    def __init__(self, product: str, problems: list[str]):
+        super().__init__(f"{product}: " + "; ".join(problems))
+        self.product, self.problems = product, problems
 
 
-def estimate_percentages_from_rank(
-    names: list[str],
-    nutrients: dict[str, float | None],
-    decay: float = 0.65,
-) -> dict[str, float]:
-    """Estimate ingredient percentages using geometric rank decay, then calibrate"""
-    n = len(names)
-    if n == 0:
-        return {}
+class SamplingFailure(InconsistentLabel):
+    """The outer bounds admit the label but no compatible composition was sampled."""
 
-    weights = np.array([decay ** i for i in range(n)])
-    weights = weights / weights.sum() * 100.0
 
-    MACRO_PROFILES: dict[str, dict[str, float]] = {
-        "sugar":          {"carb": 1.00, "fat": 0.00, "protein": 0.00},
-        "brown_sugar":    {"carb": 0.97, "fat": 0.00, "protein": 0.00},
-        "glucose_syrup":  {"carb": 0.80, "fat": 0.00, "protein": 0.00},
-        "cocoa_mass":     {"carb": 0.25, "fat": 0.50, "protein": 0.12},
-        "cocoa_butter":   {"carb": 0.00, "fat": 1.00, "protein": 0.00},
-        "cocoa_powder":   {"carb": 0.35, "fat": 0.12, "protein": 0.20},
-        "whole_milk":     {"carb": 0.05, "fat": 0.04, "protein": 0.03},
-        "milk_powder":    {"carb": 0.38, "fat": 0.27, "protein": 0.26},
-        "skimmed_milk_powder": {"carb": 0.52, "fat": 0.01, "protein": 0.36},
-        "whey":           {"carb": 0.73, "fat": 0.01, "protein": 0.13},
-        "vegetable_oil":  {"carb": 0.00, "fat": 1.00, "protein": 0.00},
-        "sunflower_oil":  {"carb": 0.00, "fat": 1.00, "protein": 0.00},
-        "palm_oil":       {"carb": 0.00, "fat": 1.00, "protein": 0.00},
-        "butter":         {"carb": 0.01, "fat": 0.81, "protein": 0.01},
-        "wheat_flour":    {"carb": 0.72, "fat": 0.01, "protein": 0.10},
-        "corn_flour":     {"carb": 0.73, "fat": 0.04, "protein": 0.07},
-        "potato":         {"carb": 0.17, "fat": 0.00, "protein": 0.02},
-        "water":          {"carb": 0.00, "fat": 0.00, "protein": 0.00},
-        "salt":           {"carb": 0.00, "fat": 0.00, "protein": 0.00},
-        "caffeine":       {"carb": 0.00, "fat": 0.00, "protein": 0.00},
-        "taurine":        {"carb": 0.00, "fat": 0.00, "protein": 0.00},
-    }
+def _off_name(ing: dict) -> str:
+    return parse_off_tag(ing.get("id", "")) if ing.get("id") else canonical_name(ing.get("text", ""))
 
-    fat_target = nutrients.get("fat_g") or nutrients.get("fat")
-    prot_target = nutrients.get("protein_g") or nutrients.get("protein")
-    carb_target = nutrients.get("carbohydrates_g") or nutrients.get("carbohydrates")
 
-    known_macros = {
-        k: v for k, v in {"fat": fat_target, "protein": prot_target, "carb": carb_target}.items()
-        if v is not None
-    }
+def _items_from_text(text: str) -> list[estimate.Item]:
+    """Top-level ingredients from a plain ingredient list (USDA, or OFF without structure)."""
+    parts, _ = estimate.split_top_level(text)
+    items = []
+    for part in parts:
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", part.split("(")[0] + " " +
+                      (part.split("(")[1] if "(" in part else ""))
+        name = canonical_name(part)
+        items.append(estimate.Item(
+            name=name,
+            off_id="",
+            cls=estimate.ingredient_class("en:" + name.replace("_", "-"), part),
+            declared=float(m.group(1).replace(",", ".")) if m else None,
+        ))
+    return items
 
-    if not known_macros:
-        return dict(zip(names, np.round(weights, 2)))
 
-    macro_keys = list(known_macros.keys())
-    A = np.zeros((len(macro_keys), n))
-    for j, name in enumerate(names):
-        profile = MACRO_PROFILES.get(name, {})
-        for m_idx, macro in enumerate(macro_keys):
-            A[m_idx, j] = profile.get(macro, 0.0)
+REPLICATES = 200
 
-    targets = np.array([known_macros[m] for m in macro_keys])
 
-    def objective(x):
-        """Minimise deviation from macro targets + deviation from geometric prior."""
-        macro_error = np.sum((A @ x - targets) ** 2)
-        prior_error = np.sum((x - weights) ** 2) * 0.1
-        return macro_error + prior_error
+def samples_path(output_csv: Path) -> Path:
+    return output_csv.with_name(f"{output_csv.stem}-samples.csv")
 
-    constraints = [{"type": "eq", "fun": lambda x: np.sum(x) - 100}]
-    bounds = [(0.01, 99) for _ in range(n)]
 
+def samples_meta_path(output_csv: Path) -> Path:
+    return output_csv.with_name(f"{output_csv.stem}-samples.json")
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def publish_together(pairs: list[tuple[Path, Path]]) -> None:
+    """Move several temporary files into place as one unit: files being replaced are moved
+    aside first and put back if any move fails.
+
+    This covers errors raised during publication, not the process being killed half way. In
+    that case the folder may hold files from two runs; the fingerprints in
+    foods-samples.json then no longer match, render.py refuses those replicates and asks for
+    normalise to be rerun, so no support is ever computed from mismatched files."""
+    moved, placed = [], []
     try:
-        result = minimize(
-            objective,
-            x0=weights,
-            method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
-            options={"ftol": 1e-6, "maxiter": 500},
-        )
-        if result.success:
-            return dict(zip(names, np.round(result.x, 2)))
-    except Exception:
-        pass
-
-    return dict(zip(names, np.round(weights, 2)))
-
-
-LOW_FAT_WORDS = ("potato", "corn", "maize", "wheat", "rice", "flour", "starch", "meal",
-                 "semolina", "cereal", "maltodextrin", "tapioca")
-MINOR_WORDS = ("flavour", "flavor", "aroma", "season", "condiment", "prepar", "whey", "cheese", "milk",
-               "cream", "buttermilk", "tomato", "onion", "garlic", "paprika", "pepper", "yeast", "sugar",
-               "dextrose", "acid", "extract", "spice", "lactose", "vinegar", "sweetener", "colour",
-               "color", "protein", "enhancer", "antioxidant", "emulsifier")
-SALT_NAMES = {"salt", "sea_salt"}
+        for tmp, dest in pairs:
+            if dest.exists():
+                backup = dest.with_name(f".{dest.name}.previous")
+                os.replace(dest, backup)
+                moved.append((backup, dest))
+            os.replace(tmp, dest)
+            placed.append(dest)
+    except BaseException:
+        for dest in placed:
+            dest.unlink(missing_ok=True)
+        for backup, dest in moved:
+            os.replace(backup, dest)
+        raise
+    for backup, _ in moved:
+        backup.unlink(missing_ok=True)
 
 
-def _is_additive(name: str) -> bool:
-    """E-numbers, flavourings and seasoning ingredients: present in small amounts."""
-    return bool(re.match(r"^e\d{3}[a-z]*(_|$)", name)) or any(w in name for w in MINOR_WORDS)
+def normalise_product(raw: dict, comp: dict, moisture: tuple[float, float] = (0.0, 100.0),
+                      allow_inconsistent: bool = False) -> tuple[list[dict], list[dict]] | None:
+    """Rows of foods.csv for one product and its replicate compositions, or None if it has no
+    usable ingredient data.
 
+    Replicates are REPLICATES compositions resampled from the estimator's weighted samples;
+    render.py uses them to measure how well supported each branch of a tree is.
 
-def estimate_fried_snack(names: list[str], declared: dict[str, float],
-                         nutrients: dict[str, float | None], decay: float = 0.65):
-    """Crisps and similar snacks, on a finished-product basis.
-
-    Declared percentages are kept. Oils get the fat of the nutrition table, salt gets the salt
-    of the table, additives get a trace, and the rest is shared by rank. Returns None when the
-    product is not of this kind (the general estimator is used instead).
+    Percentages are on a finished-product basis: the dry matter each ingredient leaves in
+    100 g of product, plus residual water as its own row. Each is the weighted mean of the
+    compositions compatible with the label (see estimate.py), with PctLow and PctHigh its
+    bounds. Raises InconsistentLabel when no composition satisfies the label, unless
+    allow_inconsistent is set (the least-violating composition is then used).
     """
-    fat, salt = nutrients.get("fat_g"), nutrients.get("salt_g")
-    fats = [n for n in names if n.endswith(("_oil", "_fat"))]
-    salts = [n for n in names if n in SALT_NAMES]
-    additives = [n for n in names if _is_additive(n)]
-    base = [n for n in names if n not in fats and n not in salts and n not in additives]
-    if fat is None or not fats or not base or not all(any(w in n for w in LOW_FAT_WORDS) for n in base):
-        return None
-    pct = {n: declared[n] for n in names if n in declared}
-    left = lambda: max(100.0 - sum(pct.values()), 0.0)
-    for n in salts:
-        if n not in pct and salt is not None:
-            pct[n] = min(salt, left())
-    free_fats = [n for n in fats if n not in pct]
-    if free_fats:
-        total = max(fat - sum(pct[n] for n in fats if n in pct), 0.0)
-        for n in free_fats:
-            pct[n] = min(total / len(free_fats), left())
-    for n in additives:
-        if n not in pct:
-            pct[n] = min(0.1, left())
-    free_base = [n for n in base if n not in pct]
-    if free_base:
-        w = np.array([decay ** i for i in range(len(free_base))])
-        for n, share in zip(free_base, w / w.sum() * left()):
-            pct[n] = float(share)
-    return {n: round(pct.get(n, 0.0), 3) for n in names}
-
-
-def normalise_product(raw: dict) -> list[dict] | None:
-    """Normalise a single product. Returns list of row dicts or None if no data."""
     product_name = raw["product_name"]
     off = raw.get("off_data") or {}
     usda = raw.get("usda_data") or {}
 
-
-    raw_ingredients = off.get("ingredients", [])
-    names: list[str] = []
-    pct_map: dict[str, float | None] = {}
-
-    if raw_ingredients:
-        seen: set[str] = set()
-        for ing in raw_ingredients:
-            raw_id = ing.get("id", "")
-            raw_text = ing.get("text", "")
-            name = parse_off_tag(raw_id) if raw_id else canonical_name(raw_text)
-            if not name or name in seen:
-                continue
-            if _is_label_text(name):
-                continue
-            seen.add(name)
-            names.append(name)
-            pct = ing.get("percent_estimate")
-            pct_map[name] = float(pct) if pct is not None else None
-
+    if off.get("ingredients"):
+        items, notes = estimate.top_level_items(off, _off_name)
     else:
-        off_text = off.get("ingredients_raw_text", "")
-        usda_text = ""
-        if usda:
-            usda_desc = (usda.get("usda_description") or "").lower()
-            stopwords = {"a", "an", "the", "of", "with", "and", "or", "for",
-                         "in", "on", "at", "to", "by", "fish", "food", "s"}
-            query_words = {w.lower() for w in product_name.split()
-                           if len(w) > 2 and w.lower() not in stopwords}
-            if query_words and any(w in usda_desc for w in query_words):
-                usda_text = usda.get("ingredients_raw_text", "")
-            elif query_words:
-                print(f"  [normalise] USDA match rejected (brand mismatch: '{usda_desc[:40]}')",
+        text = off.get("ingredients_raw_text", "")
+        if not text and usda:
+            desc = (usda.get("usda_description") or "").lower()
+            words = {w.lower() for w in product_name.split() if len(w) > 2}
+            if words and any(w in desc for w in words):
+                text = usda.get("ingredients_raw_text", "")
+            else:
+                print(f"  [normalise] USDA match rejected (brand mismatch: '{desc[:40]}')",
                       file=sys.stderr)
-
-        raw_text = off_text or usda_text
-        if not raw_text:
+        if not text:
             print(f"  [normalise] No reliable ingredient data for '{product_name}' "
-                  f"— add it manually to foods.csv", file=sys.stderr)
+                  f"— add it with --manual", file=sys.stderr)
             return None
-        seen = set()
-        for part in re.split(r"[,;]", raw_text):
-            name = canonical_name(part)
-            if name and name not in seen and not _is_label_text(name):
-                seen.add(name)
-                names.append(name)
-                pct_map[name] = None
-
-    if not names:
-        print(f"  [normalise] Could not extract ingredient names for '{product_name}'", file=sys.stderr)
+        items, notes = _items_from_text(text), []
+    items = [it for it in items if it.name and not _is_label_text(it.name)]
+    for it in items:
+        if it.cls == "potato_dehydrated" and it.name == "potato":
+            it.name = "dehydrated_potato"
+    if not items:
+        print(f"  [normalise] Could not extract ingredient names for '{product_name}'",
+              file=sys.stderr)
         return None
+    for note in notes:
+        print(f"  [normalise] {product_name}: {note}", file=sys.stderr)
 
-    nutrients = {
-        **(usda.get("nutrients_per_100g") or {}),
-        **(off.get("nutrients_per_100g") or {}),
-    }
+    nutrients = {**(usda.get("nutrients_per_100g") or {}), **(off.get("nutrients_per_100g") or {})}
     nutrients = {k: v for k, v in nutrients.items() if v is not None}
-    declared = {}
-    for ing in raw_ingredients:
-        name = parse_off_tag(ing.get("id", "")) if ing.get("id") else canonical_name(ing.get("text", ""))
-        if ing.get("percent") is not None and name in names:
-            declared[name] = float(ing["percent"])
-    snack = estimate_fried_snack(names, declared, nutrients)
+    est = estimate.estimate_product(items, nutrients, comp, moisture=moisture,
+                                    allow_inconsistent=allow_inconsistent)
+    for warning in est.warnings:
+        print(f"  [normalise] {product_name}: {warning}", file=sys.stderr)
+    if est.sampling_failed:
+        raise SamplingFailure(product_name, est.problems)
+    if not est.feasible and not allow_inconsistent:
+        raise InconsistentLabel(product_name, est.problems)
+    if not est.feasible:
+        print(f"  [normalise] {product_name}: inconsistent label, least-violating composition "
+              f"used ({'; '.join(est.problems)})", file=sys.stderr)
+    if len(est.samples) == 0:
+        raise InconsistentLabel(product_name, est.problems or ["no compatible composition found"])
 
-    available = [v for v in pct_map.values() if v is not None]
-    coverage = len(available) / len(names) if names else 0
-
-    if snack is not None:
-        pct_map = snack
-        source_note = "label+nutrition"
-    elif coverage < 0.5:
-        nutrients = {
-            **(usda.get("nutrients_per_100g") or {}),
-            **(off.get("nutrients_per_100g") or {}),
-        }
-        nutrients = {k: v for k, v in nutrients.items() if v is not None}
-        estimated = estimate_percentages_from_rank(names, nutrients)
-        for name in names:
-            if pct_map.get(name) is None:
-                pct_map[name] = estimated.get(name, 0.0)
-        source_note = "estimated"
-    else:
-        nutrients = {
-            **(usda.get("nutrients_per_100g") or {}),
-            **(off.get("nutrients_per_100g") or {}),
-        }
-        nutrients = {k: v for k, v in nutrients.items() if v is not None}
-        estimated = estimate_percentages_from_rank(names, nutrients)
-        for name in names:
-            if pct_map.get(name) is None:
-                pct_map[name] = estimated.get(name, 0.0)
-        source_note = "off_estimate"
-
-    source = off.get("source", "openfoodfacts")
-    if usda.get("source"):
-        source = f"{source}+usda"
-
+    centre = est.weights @ est.samples
     rows = []
-    total = sum(pct_map.get(n, 0) or 0 for n in names)
-
-    if total > 0 and abs(total - 100) > 5:
-        scale = 100.0 / total
-    else:
-        scale = 1.0
-
-    for name in names:
-        pct = pct_map.get(name) or 0.0
-        pct = round(pct * scale, 3)
-        if pct <= 0:
-            continue
+    for i, it in enumerate(items):
+        source = ("inconsistent-label" if not est.feasible
+                  else "declared" if it.declared is not None else "label-constrained")
         rows.append({
             "FoodItem": product_name,
-            "Ingredient": name,
-            "Percentage": pct,
-            "Category": CATEGORIES.get(name, "other"),
-            "Source": source_note,
+            "Ingredient": it.name,
+            "Percentage": round(float(centre[i]), 3),
+            "PctLow": round(float(est.dry_low[i]), 3) if est.feasible else "",
+            "PctHigh": round(float(est.dry_high[i]), 3) if est.feasible else "",
+            "Category": CATEGORIES.get(it.name, "other"),
+            "Class": it.cls,
+            "Source": source,
         })
+    rows.append({
+        "FoodItem": product_name,
+        "Ingredient": "residual_water",
+        "Percentage": round(float(centre[-1]), 3),
+        "PctLow": round(float(est.water_low), 3) if est.feasible else "",
+        "PctHigh": round(float(est.water_high), 3) if est.feasible else "",
+        "Category": "water",
+        "Class": "",
+        "Source": "inconsistent-label" if not est.feasible else "label-constrained",
+    })
+    rng = np.random.default_rng(zlib.crc32(product_name.encode("utf-8")))
+    picks = rng.choice(len(est.samples), size=REPLICATES, p=est.weights)
+    names = [it.name for it in items] + ["residual_water"]
+    replicates = [{"FoodItem": product_name, "Replicate": r, "Ingredient": name,
+                   "Percentage": round(float(v), 3)}
+                  for r, k in enumerate(picks) for name, v in zip(names, est.samples[k])]
+    return rows, replicates
 
-    return rows if rows else None
+
+def load_manual(manual_csv: Path) -> dict[str, list[dict]]:
+    """Read products entered by hand: FoodItem, Ingredient, Percentage[, Category, Source].
+
+    Percentages of each product must add up to 100 (within 1).
+    """
+    products: dict[str, list[dict]] = {}
+    with open(manual_csv, newline="", encoding="utf-8") as f:
+        for line, row in enumerate(csv.DictReader(f), 2):
+            item = (row.get("FoodItem") or "").strip()
+            ing = (row.get("Ingredient") or "").strip()
+            try:
+                pct = float(row.get("Percentage") or "")
+            except ValueError:
+                pct = -1.0
+            if not item or not ing or not math.isfinite(pct) or pct < 0:
+                sys.exit(f"Error: {manual_csv} line {line}: FoodItem, Ingredient and a "
+                         "finite, non-negative Percentage are required.")
+            name = canonical_name(ing)
+            products.setdefault(item, []).append({
+                "FoodItem": item,
+                "Ingredient": name,
+                "Percentage": pct,
+                "Category": (row.get("Category") or "").strip() or CATEGORIES.get(name, "other"),
+                "Source": (row.get("Source") or "").strip() or "manual",
+            })
+    for item, rows in products.items():
+        total = sum(r["Percentage"] for r in rows)
+        if not math.isfinite(total) or abs(total - 100) > 1:
+            sys.exit(f"Error: {manual_csv}: percentages of '{item}' add up to {total:.2f}, not 100.")
+    return products
 
 
-def normalise_all(input_json: Path, output_csv: Path) -> None:
+def omitted_path(output_csv: Path) -> Path:
+    return output_csv.with_name(f"{output_csv.stem}-omitted.txt")
+
+
+def parse_moisture(text: str | None) -> tuple[float, float]:
+    """'1-4' -> (1.0, 4.0): water of the finished product, g per 100 g."""
+    if not text:
+        return (0.0, 100.0)
+    try:
+        lo, hi = (float(x) for x in text.split("-"))
+    except ValueError:
+        sys.exit(f"Error: --moisture must look like 1-4 (g water per 100 g), not '{text}'.")
+    if not 0 <= lo <= hi <= 100:
+        sys.exit(f"Error: --moisture {text} is not a range within 0-100.")
+    return (lo, hi)
+
+
+def normalise_all(input_json: Path, output_csv: Path, manual_csv: Path | None = None,
+                  allow_missing: bool = False, moisture: tuple[float, float] = (0.0, 100.0),
+                  allow_inconsistent: bool = False) -> list[str]:
+    """Write foods.csv and foods-samples.csv (replicate compositions) and return the
+    products left out.
+
+    A product without usable data stops the run unless allow_missing is set; the products
+    left out are then listed in <output>-omitted.txt. A product whose label no composition
+    can satisfy stops the run unless allow_inconsistent is set.
+    """
     with open(input_json) as f:
         raw_products = json.load(f)
+    manual = load_manual(manual_csv) if manual_csv else {}
+    comp = estimate.load_composition()
 
     all_rows = []
     failed = []
+    all_replicates: list[dict] = []
+    inconsistent: list[InconsistentLabel] = []
+    unsampled: list[SamplingFailure] = []
 
     print(f"\nNormalising {len(raw_products)} products...\n")
 
     for i, raw in enumerate(raw_products, 1):
         name = raw["product_name"]
         print(f"[{i}/{len(raw_products)}] {name}")
-        rows = normalise_product(raw)
-        if rows:
+        if name in manual:
+            if raw.get("off_data") or raw.get("usda_data"):
+                sys.exit(f"Error: '{name}' was fetched and is also in {manual_csv}; "
+                         "rename one of them.")
+            print(f"  → taken from {manual_csv.name}")
+            continue
+        try:
+            result = normalise_product(raw, comp, moisture, allow_inconsistent)
+        except SamplingFailure as exc:
+            unsampled.append(exc)
+            print("  ✗ No composition sampled")
+            continue
+        except InconsistentLabel as exc:
+            inconsistent.append(exc)
+            print("  ✗ Label inconsistent")
+            continue
+        if result:
+            rows, replicates = result
             all_rows.extend(rows)
-            print(f"  ✓ {len(rows)} ingredients  (percentages: {rows[0]['Source']})")
+            all_replicates.extend(replicates)
+            print(f"  ✓ {len(rows) - 1} ingredients + residual water")
         else:
             failed.append(name)
             print(f"  ✗ Failed")
 
+    kept = (f"\n{output_csv.name} was left unchanged and belongs to an earlier run."
+            if output_csv.exists() else "")
+    messages = []
+    if inconsistent:
+        details = "\n".join(f"  {e.product}: {'; '.join(e.problems)}" for e in inconsistent)
+        messages.append("No composition satisfies the label of these products (constraints "
+                        f"that would have to be relaxed):\n{details}\nCheck their data, or "
+                        "rerun with --allow-inconsistent to use the least-violating composition.")
+    if unsampled:
+        details = "\n".join(f"  {e.product}" for e in unsampled)
+        messages.append("For these products the label is possible within the outer bounds, but "
+                        f"no compatible composition was sampled:\n{details}\nThe label data may "
+                        "be fine: check the composition classes of their ingredients "
+                        "(data/ingredient_composition.csv and ingredient_class in estimate.py).")
+    if messages:
+        sys.exit("Error: " + "\n\n".join(messages) + kept)
+
+    for name, rows in manual.items():
+        all_rows.extend(rows)
+        print(f"[manual] {name}\n  ✓ {len(rows)} ingredients  (from {manual_csv.name})")
+
+    omitted_file = omitted_path(output_csv)
+    if failed and not allow_missing:
+        kept = (f" {output_csv.name} was left unchanged and belongs to an earlier run."
+                if output_csv.exists() else "")
+        sys.exit(f"Error: no usable data for {len(failed)} product(s): {', '.join(failed)}. "
+                 "Fix their barcodes, add them with --manual, or rerun with --allow-missing "
+                 f"to build the tree without them.{kept}")
+
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["FoodItem", "Ingredient", "Percentage", "Category", "Source"]
-    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+    fieldnames = ["FoodItem", "Ingredient", "Percentage", "PctLow", "PctHigh", "Category", "Class",
+                  "Source"]
+    tmp_csv = output_csv.with_name(f".{output_csv.name}.tmp")
+    with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_rows)
-
-    print(f"\n✓ Saved {len(all_rows)} rows to {output_csv}")
-    print(f"  Products written: {len(raw_products) - len(failed)}/{len(raw_products)}")
+    tmp_samples = output_csv.with_name(f".{samples_path(output_csv).name}.tmp")
+    with open(tmp_samples, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["FoodItem", "Replicate", "Ingredient", "Percentage"])
+        writer.writeheader()
+        writer.writerows(all_replicates)
+    tmp_meta = output_csv.with_name(f".{samples_meta_path(output_csv).name}.tmp")
+    tmp_meta.write_text(json.dumps({
+        "foods_sha256": file_sha256(tmp_csv),
+        "samples_sha256": file_sha256(tmp_samples),
+        "replicates": REPLICATES,
+        "products_with_replicates": sorted({r["FoodItem"] for r in all_replicates}),
+    }, indent=2), encoding="utf-8")
+    try:
+        publish_together([(tmp_csv, output_csv), (tmp_samples, samples_path(output_csv)),
+                          (tmp_meta, samples_meta_path(output_csv))])
+    finally:
+        for tmp in (tmp_csv, tmp_samples, tmp_meta):
+            tmp.unlink(missing_ok=True)
     if failed:
-        print(f"  Failed: {', '.join(failed)}", file=sys.stderr)
+        omitted_file.write_text("\n".join(failed) + "\n", encoding="utf-8")
+    else:
+        omitted_file.unlink(missing_ok=True)
+
+    written = len({r["FoodItem"] for r in all_rows})
+    print(f"\n✓ Saved {len(all_rows)} rows to {output_csv}")
+    print(f"  Products written: {written} ({len(manual)} manual), omitted: {len(failed)}")
+    if failed:
+        print(f"  Omitted (--allow-missing): {', '.join(failed)} → {omitted_file.name}",
+              file=sys.stderr)
+    return failed
 
 
 def main():
     parser = argparse.ArgumentParser(description="FoodTree Stage 2: Normalise ingredients")
     parser.add_argument("--input", required=True, help="raw_products.json from fetch.py")
     parser.add_argument("--output", required=True, help="Output foods.csv path")
+    parser.add_argument("--manual", default=None,
+                        help="CSV of products entered by hand (FoodItem, Ingredient, Percentage"
+                             "[, Category, Source])")
+    parser.add_argument("--allow-missing", action="store_true",
+                        help="Leave out products without usable data instead of stopping")
+    parser.add_argument("--moisture", default=None,
+                        help="Water of the finished products, g per 100 g, as LO-HI (e.g. 1-4 "
+                             "for crisps); by default it is left to the nutrition table")
+    parser.add_argument("--allow-inconsistent", action="store_true",
+                        help="Keep products whose label no composition satisfies, using the "
+                             "least-violating composition")
     args = parser.parse_args()
-    normalise_all(Path(args.input), Path(args.output))
+    normalise_all(Path(args.input), Path(args.output),
+                  Path(args.manual) if args.manual else None, args.allow_missing,
+                  parse_moisture(args.moisture), args.allow_inconsistent)
 
 
 if __name__ == "__main__":

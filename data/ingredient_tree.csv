@@ -1,0 +1,41 @@
+node,parent,classes,categories,note
+root,,,,
+starchy_base,root,,,"Ingredients that supply starch: plants and their flours, starches and dextrins"
+potato_products,starchy_base,potato_raw;potato_dehydrated;potato_flour;potato_starch,,Open Food Facts: en:potato and its forms
+potato,potato_products,,,Fresh potato (en:potato)
+dehydrated_potato,potato_products,,,"Dried or dehydrated potato, flakes (en:potato with processing en:dehydrated or en:dried)"
+potato_flour,potato_products,,,en:potato-flour (parents en:flour and en:potato)
+potato_starch,potato_products,,,en:potato-starch (parent en:starch); placed under its source plant
+maize_products,starchy_base,corn_grain;corn_flour;cornmeal;corn_starch,,Open Food Facts: en:corn and its forms
+corn,maize_products,,,Maize grain (en:corn)
+cornmeal,maize_products,,,en:cornmeal (parent en:corn)
+corn_flour,maize_products,,,en:corn-flour (parents en:corn and en:flour)
+corn_starch,maize_products,,,en:corn-starch (parent en:starch); placed under its source plant
+wheat_products,starchy_base,wheat_flour,,Open Food Facts: en:wheat
+wheat_flour,wheat_products,,,en:wheat-flour (parents en:cereal-flour and en:wheat)
+rice_products,starchy_base,rice_flour,,Open Food Facts: en:rice
+rice_flour,rice_products,,,en:rice-flour (parents en:flour and en:rice)
+dextrins,starchy_base,maltodextrin,,Starch hydrolysates
+maltodextrin,dextrins,,,en:maltodextrin
+fats,root,,fat,Oils and fats
+vegetable_oils,fats,oil,,en:vegetable-oil and its children
+vegetable_oil,vegetable_oils,,,Vegetable oil of unspecified or mixed origin (en:vegetable-oil)
+sunflower_oil,vegetable_oils,,,en:sunflower-oil (parent en:vegetable-oil)
+corn_oil,vegetable_oils,,,en:corn-oil (parent en:vegetable-oil)
+rapeseed_oil,vegetable_oils,,,en:rapeseed-oil (parent en:vegetable-oil)
+palm_oil,vegetable_oils,,,en:palm-oil (parent en:vegetable-oil)
+salts,root,salt;potassium_chloride,mineral,Salt and salt substitutes
+salt,salts,,,en:salt; en:sea-salt is harmonised to it
+e508,salts,,,"Potassium chloride (en:e508), a salt substitute"
+seasonings,root,cheese_seasoning,flavouring,Seasonings and flavourings
+natural_flavouring,seasonings,,,en:flavouring
+additives,root,additive;sodium_additive,additive,Food additives (E numbers); each one becomes its own leaf here
+water,root,,water,Residual water of the finished product
+residual_water,water,,,"Computed by estimate.py, not an ingredient on the label"
+plant_bases,root,,base,"Other main plant ingredients not in the groups above (cocoa, tomato, ...)"
+sweeteners,root,,sweetener,"Sugars, syrups and other sweeteners"
+dairy,root,,dairy,Milk and dairy ingredients
+protein_foods,root,,protein,"Meat, fish, eggs, legumes and protein isolates"
+stimulants,root,,stimulant,"Caffeine, taurine and similar"
+vitamins,root,,vitamin,Added vitamins
+other,root,unknown,other,Ingredients whose class is unknown
